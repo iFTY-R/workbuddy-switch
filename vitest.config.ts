@@ -11,8 +11,10 @@ export default defineConfig({
     },
   },
   test: {
-    // 首批只覆盖纯逻辑模块（无 DOM 依赖），node 环境足够且启动最快。
+    // 默认 node 环境：多数用例是纯逻辑模块，启动最快。
+    // 组件测试（*.test.tsx）在文件头用 `@vitest-environment jsdom` 单文件声明 DOM 环境，
+    // 不把整个套件拖进 jsdom。
     environment: "node",
-    include: ["src/**/*.test.ts"],
+    include: ["src/**/*.test.ts", "src/**/*.test.tsx"],
   },
 });

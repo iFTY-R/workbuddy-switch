@@ -799,11 +799,20 @@ function AddLinkedSessionDialog({ client, disabled, onDone, requestRestartConfir
       const report = await api.copySessionsCross(sourceAccount.id, targetAccountId, [...selected]);
       const copied = report.copied?.length ?? 0;
       const alreadyLinked = report.alreadyLinked?.length ?? 0;
+      // 旧版本写出的副本带着源账号的项目归属，重跑复制会顺手修掉——这类条目要单独说清楚，
+      // 否则用户看到「已存在，未重复复制」会以为「还是看不到」没有任何变化。
+      const repaired = (report.alreadyLinked ?? []).filter((item) => (item.repaired?.length ?? 0) > 0).length;
       const errors = report.errors ?? [];
       const targetName = targetAccount ? displayName(targetAccount) : "目标账号";
       // 同一份报告可能同时含已复制、已存在与失败项：各分支各自提示，互不隐藏。
       if (copied > 0) toast.success(`已复制 ${copied} 个会话到「${targetName}」并建立关联`);
-      if (alreadyLinked > 0) toast.info(`「${targetName}」已存在 ${alreadyLinked} 个会话的副本，未重复复制`);
+      if (alreadyLinked > 0) {
+        toast.info(
+          repaired > 0
+            ? `「${targetName}」已存在 ${alreadyLinked} 个会话的副本，其中 ${repaired} 个已修复归属，请刷新会话列表查看`
+            : `「${targetName}」已存在 ${alreadyLinked} 个会话的副本，未重复复制`,
+        );
+      }
       if (errors.length > 0) {
         const allFailed = copied === 0 && alreadyLinked === 0;
         toast.error(allFailed ? "复制失败" : "部分会话复制失败", {
@@ -948,10 +957,16 @@ function notifyResult(report: { synced?: unknown[]; skipped?: unknown[]; errors?
   const synced = report.synced?.length ?? 0;
   const skipped = report.skipped?.length ?? 0;
   const errors = report.errors ?? [];
+  // 旧版本复制写出的副本带着源账号的项目归属，同步时会被顺手清掉（跨客户端报告同形，
+  // 缺该字段的类型按空处理）；这类项要在提示里说清楚，否则用户会以为「同步了还是看不见」。
+  const repaired = (report.synced ?? []).filter((item) => {
+    const fields = item as { repaired?: string[] } | null;
+    return (fields?.repaired?.length ?? 0) > 0;
+  }).length;
   const restartHint = report.restartedVariants?.length
     ? `，已重新打开 ${report.restartedVariants.map(variantLabel).join("、")}`
     : report.restartedEditor ? "，已重新打开 VS Code" : "";
-  if (synced > 0) toast.success(targetName ? `已同步到「${targetName}」` : `已同步 ${synced} 个会话`, { description: `完成 ${synced} 项${restartHint}` });
+  if (synced > 0) toast.success(targetName ? `已同步到「${targetName}」` : `已同步 ${synced} 个会话`, { description: `完成 ${synced} 项${restartHint}${repaired > 0 ? `；其中 ${repaired} 项已修复项目归属，会话列表刷新后可见` : ""}` });
   if (skipped > 0) toast.warning(`有 ${skipped} 项跳过`, { description: "预览过期或复核后不再符合安全条件的项不会计为成功。" });
   if (errors.length > 0) toast.error("部分会话同步失败", { description: errors.map((item) => item.error).join("；") });
   if (report.needsRecovery) toast.error("会话操作待恢复", { description: report.temporaryFiles?.map((item) => item.reason).join("；") || "已保留恢复所需材料。" });

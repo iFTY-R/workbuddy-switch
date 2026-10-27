@@ -139,6 +139,11 @@ export interface CopyResult {
   cleanupState?: SessionBackupCleanupState;
   /** 清理失败原因（`cleanupState` 为 pending 时有值）。 */
   cleanupError?: string;
+  /**
+   * 本次归一改写的列名（跨账号不能继承的属性，如 `project_id` / `status`）。
+   * 目标账号「看不到刚复制的会话」时先看这里；旧后端不返回该字段。
+   */
+  normalized?: string[];
 }
 
 /** 目标账号上已有真实有效的副本：复用而不是重复复制。 */
@@ -146,6 +151,8 @@ export interface LinkedCopyResult {
   id: string;
   sessionId: string;
   groupId: string;
+  /** 本次顺手修复的列名（旧版本写出的副本带着源账号的项目归属）。 */
+  repaired?: string[];
 }
 
 /** 切换时的会话复制报告；复制失败时后端只回 `error`（切换本身仍继续）。 */
@@ -264,6 +271,12 @@ export interface SessionSyncResultItem {
   /** 成功后立即清理：cleaned 表示临时备份已回收；pending 表示待下次维护重试。 */
   cleanupState?: SessionBackupCleanupState;
   cleanupError?: string;
+  /**
+   * 本次顺手修复的行字段。目前只有 `project_id`：旧版本复制会把源账号的项目归属
+   * 抄到目标副本上，客户端据此把会话判成 project 空间，同步成功也「看不到」。
+   * 旧后端不返回该字段。
+   */
+  repaired?: string[];
   message: string;
 }
 

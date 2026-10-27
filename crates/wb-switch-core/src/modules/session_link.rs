@@ -239,6 +239,12 @@ impl LinkStore {
 }
 
 /// 一个逻辑会话的接力组：同一逻辑会话的各账号副本归入同一组。
+///
+/// **命名注意**：这里的 `id` 是**关联组** id，只活在本模块的存储
+/// （`session_links.json` / 预览凭据 / 基线的 `groupId`）里；它与
+/// `workbuddy.db` `sessions` 表的 `group_id` 列（客户端的**云端会话分组**，
+/// 由 edge-sync 从账号侧同步，跨账号不可继承）同名但**毫无关系**。
+/// 读到 `groupId` 时先确认来自哪一侧，两者混用会写出「组内成员对不上」的关联记录。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LinkGroup {

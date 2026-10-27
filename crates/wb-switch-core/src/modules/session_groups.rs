@@ -317,18 +317,26 @@ fn sync_unify_batch_workbuddy(
                 }
             }
             Err(error) => {
-                combined["errors"].as_array_mut().unwrap().push(json!({
-                    "error": format!("{}：{error}", pair.target.uid),
-                }));
+                push_report_item(
+                    &mut combined,
+                    "errors",
+                    json!({
+                        "error": format!("{}：{error}", pair.target.uid),
+                    }),
+                );
                 break;
             }
         }
     }
 
     if combined["needsRecovery"] == true {
-        combined["errors"].as_array_mut().unwrap().push(json!({
-            "error": "会话写入待恢复，已暂停重新打开客户端；请先处理恢复提示",
-        }));
+        push_report_item(
+            &mut combined,
+            "errors",
+            json!({
+                "error": "会话写入待恢复，已暂停重新打开客户端；请先处理恢复提示",
+            }),
+        );
         return Ok(combined);
     }
     for variant in &closed {
@@ -336,15 +344,23 @@ fn sync_unify_batch_workbuddy(
             Ok(recovery) if !crate::modules::switch::recovery_blocks_startup(&recovery) => {}
             Ok(recovery) => {
                 combined["needsRecovery"] = json!(true);
-                combined["errors"].as_array_mut().unwrap().push(json!({
-                    "error": format!("{}仍有待恢复的会话写入（{}），已暂停重新打开客户端", workbuddy_variant_label(*variant), crate::modules::switch::recovery_blocking_detail(&recovery)),
-                }));
+                push_report_item(
+                    &mut combined,
+                    "errors",
+                    json!({
+                        "error": format!("{}仍有待恢复的会话写入（{}），已暂停重新打开客户端", workbuddy_variant_label(*variant), crate::modules::switch::recovery_blocking_detail(&recovery)),
+                    }),
+                );
             }
             Err(error) => {
                 combined["needsRecovery"] = json!(true);
-                combined["errors"].as_array_mut().unwrap().push(json!({
-                    "error": format!("{}无法检查会话恢复状态（{error}），已暂停重新打开客户端", workbuddy_variant_label(*variant)),
-                }));
+                push_report_item(
+                    &mut combined,
+                    "errors",
+                    json!({
+                        "error": format!("{}无法检查会话恢复状态（{error}），已暂停重新打开客户端", workbuddy_variant_label(*variant)),
+                    }),
+                );
             }
         }
     }
@@ -354,9 +370,13 @@ fn sync_unify_batch_workbuddy(
     let mut reopened = Vec::new();
     for variant in closed {
         if let Err(error) = process::launch_workbuddy(variant, None) {
-            combined["errors"].as_array_mut().unwrap().push(json!({
-                "error": format!("{}会话已处理，但客户端重新打开失败：{error}", workbuddy_variant_label(variant)),
-            }));
+            push_report_item(
+                &mut combined,
+                "errors",
+                json!({
+                    "error": format!("{}会话已处理，但客户端重新打开失败：{error}", workbuddy_variant_label(variant)),
+                }),
+            );
         } else {
             reopened.push(variant.as_str());
         }
@@ -387,9 +407,13 @@ fn sync_unify_batch_vscode(
         match run_pair_sync(client, scope, &pair, &[selection], editor_prepared) {
             Ok(report) => merge_sync_report(&mut combined, report),
             Err(error) => {
-                combined["errors"].as_array_mut().unwrap().push(json!({
-                    "error": format!("{}：{error}", pair.target.uid),
-                }));
+                push_report_item(
+                    &mut combined,
+                    "errors",
+                    json!({
+                        "error": format!("{}：{error}", pair.target.uid),
+                    }),
+                );
                 break;
             }
         }
@@ -474,12 +498,16 @@ pub fn sync_safe_batch(
         )?;
         let preview = preview_resolved_pair(client, scope, &pair)?;
         if preview.get("verdict").and_then(Value::as_str) != Some("fastForward") {
-            combined["skipped"].as_array_mut().unwrap().push(json!({
-                "groupId": group_id,
-                "targetMemberId": target_member_id,
-                "reasonCode": "recheckNotFastForward",
-                "message": "重新检查后该副本不再属于安全快进范围",
-            }));
+            push_report_item(
+                &mut combined,
+                "skipped",
+                json!({
+                    "groupId": group_id,
+                    "targetMemberId": target_member_id,
+                    "reasonCode": "recheckNotFastForward",
+                    "message": "重新检查后该副本不再属于安全快进范围",
+                }),
+            );
             continue;
         }
         let token = preview
@@ -1348,6 +1376,22 @@ fn merge_sync_report(into: &mut Value, item: Value) {
     }
     if item.get("needsRecovery").and_then(Value::as_bool) == Some(true) {
         combined.insert("needsRecovery".to_owned(), json!(true));
+    }
+}
+
+/// 往汇总报告里追加一条记录，**槽位缺失或不是数组时自动补成数组**。
+///
+/// 直接用 `combined[key].as_array_mut().unwrap()` 会 panic：`IndexMut` 对缺失键只会补
+/// `Null`，而汇总对象的初始 schema 与合并键列表是会漂移的（`merge_sync_report` 里
+/// 已经踩过一次，见它的注释）。这里统一收口，调用方不用关心现场。
+fn push_report_item(combined: &mut Value, key: &str, item: Value) {
+    let Some(map) = combined.as_object_mut() else {
+        return;
+    };
+    let slot = map.entry(key.to_owned()).or_insert_with(|| json!([]));
+    match slot {
+        Value::Array(items) => items.push(item),
+        slot => *slot = json!([item]),
     }
 }
 

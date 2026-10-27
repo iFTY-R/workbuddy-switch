@@ -1,0 +1,124 @@
+name: build-exe
+
+# 只出 Windows 安装包的轻量构建。
+#
+# 与 build.yml 的分工：
+#   build.yml     上游多平台发布 —— npm 平台包 + 主包 + 桌面 App + 更新清单，
+#                 依赖 secrets.NPM_TOKEN 与 secrets.TAURI_SIGNING_PRIVATE_KEY。
+#   build-exe.yml 本文件 —— 一个 NSIS 安装包，不碰 npm、不需要任何密钥。
+#
+# 触发方式是四位版本号 tag（v0.1.62.1）：build.yml 里的 version-gate 用正则把这
+# 类 tag 挡在四平台发布之外，所以同一个 tag 不会同时跑两套发布流程。
+on:
+  push:
+    tags: ["v*.*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-exe-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-exe:
+    name: win-x64 exe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: x86_64-pc-windows-msvc
+          # 与 build.yml 一致：不给 RUSTFLAGS 加 -D warnings，发版构建不承担 lint 门禁
+          # （自有代码的告警由 test.yml 的 lint job 把关）。
+          rustflags: ""
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-exe-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-exe-
+            ${{ runner.os }}-cargo-
+
+      - name: Build frontend
+        run: |
+          npm install
+          npm run build
+
+      # 安装包不参与自动更新：关掉 updater 产物就不需要签名私钥。
+      # 用 --config 内联覆盖而不是改 tauri.conf.json —— 仓库里的配置留给上游发布用。
+      - name: Build NSIS installer
+        shell: bash
+        run: |
+          npm run tauri -- build \
+            --target x86_64-pc-windows-msvc \
+            --bundles nsis \
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      # tag 才是「这次构建叫什么」的来源；手动触发时退回清单里的版本，避免文件名带 ref 里的斜杠。
+      - name: Collect installer
+        shell: bash
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            VER="${GITHUB_REF_NAME#v}"
+          else
+            VER="$(grep '^version' src-tauri/Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')-dev"
+          fi
+
+          BUNDLE="target/x86_64-pc-windows-msvc/release/bundle/nsis"
+          echo "bundle contents:"
+          find "$BUNDLE" -maxdepth 1 -type f | sort || true
+
+          EXE="$(find "$BUNDLE" -maxdepth 1 -type f -name '*-setup.exe' | sort | head -1)"
+          if [ -z "$EXE" ]; then
+            echo "error: no *-setup.exe produced under $BUNDLE" >&2
+            exit 1
+          fi
+
+          mkdir -p out
+          OUT="out/workbuddy-switch_${VER}_x64-setup.exe"
+          cp "$EXE" "$OUT"
+
+          # 校验和用 node 算：git bash 的 coreutils 在 Windows runner 上不保证齐全。
+          node -e "
+            const { createHash } = require('crypto');
+            const fs = require('fs');
+            const path = require('path');
+            const file = process.argv[1];
+            const hash = createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+            fs.writeFileSync('out/SHA256SUMS.txt', hash + '  ' + path.basename(file) + '\n');
+          " "$OUT"
+          cat out/SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: win-x64-exe-${{ github.ref_name }}
+          path: out/
+          if-no-files-found: error
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            out/*.exe
+            out/SHA256SUMS.txt
+          # 只上传安装包本体，不生成 latest-*.json：这份构建不参与自动更新，
+          # 让它去覆盖上游的更新清单会把用户带到这条分支上。
+          body: |
+            Windows x64 安装包（NSIS），由 `build-exe.yml` 单独构建。
+
+            - 文件：`workbuddy-switch_<tag 去掉 v 前缀>_x64-setup.exe`
+            - 应用内部版本仍为 0.1.62；tag 的第四位只表示「在 0.1.62 之上叠的构建序号」
+            - 不含 macOS / Linux 产物，也不含 npm 包与自动更新清单

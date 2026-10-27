@@ -20,8 +20,32 @@ permissions:
   contents: write
 
 jobs:
+  # 四位版本号（如 v0.1.62.1）表示「在某次发布上叠补丁」的构建：npm 不接受这种
+  # 版本号，也不该覆盖上游的更新清单，因此交给 build-exe.yml 只出 Windows 安装包。
+  # 这里用正则精确闸住（不用 tag 通配符 —— `!v*.*.*.*` 会连 v0.2.0-beta.1 这类
+  # 预发布 tag 一起排掉）。闸住 select-matrix 即可：build 依赖它，publish-main 与
+  # release 又依赖 build，被跳过的 job 会顺着 needs 链一起跳过。
+  version-gate:
+    name: Version gate
+    runs-on: ubuntu-latest
+    outputs:
+      full_release: ${{ steps.gate.outputs.full_release }}
+    steps:
+      - id: gate
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [[ "$REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "full_release=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::$REF_NAME 是四位版本 tag，只出 Windows 安装包（见 build-exe.yml），跳过四平台发布"
+          else
+            echo "full_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
   select-matrix:
     name: Select platforms
+    needs: version-gate
+    if: needs.version-gate.outputs.full_release == 'true'
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set.outputs.matrix }}

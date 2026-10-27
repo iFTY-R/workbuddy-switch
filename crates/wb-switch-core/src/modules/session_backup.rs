@@ -11,6 +11,8 @@
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::fs::File;
+// 只有非 Unix 的 `sync_file` 需要显式 OpenOptions（Unix 用只读句柄即可 fsync）。
+#[cfg(not(unix))]
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};

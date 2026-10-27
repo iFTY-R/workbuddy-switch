@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::modules::lock_or_recover;
 use crate::modules::variant::WbVariant;
 
 // ---------------------------------------------------------------------------
@@ -34,7 +35,7 @@ static TRAVEL_CACHE_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Serialize travel-cache read-modify-write across depart and claim cycles.
 pub fn with_travel_cache_lock<T>(f: impl FnOnce() -> T) -> T {
-    let _guard = TRAVEL_CACHE_WRITE_LOCK.lock().unwrap();
+    let _guard = lock_or_recover(&TRAVEL_CACHE_WRITE_LOCK);
     f()
 }
 
@@ -422,7 +423,7 @@ fn save_checkin_logs_unlocked(logs: &[Value]) -> std::io::Result<()> {
 
 /// 保存签到日志（30 天过滤 + 保留最近 500 条，保持插入顺序）。
 pub fn save_checkin_logs(logs: &[Value]) -> std::io::Result<()> {
-    let _guard = CHECKIN_LOG_WRITE_LOCK.lock().unwrap();
+    let _guard = lock_or_recover(&CHECKIN_LOG_WRITE_LOCK);
     save_checkin_logs_unlocked(logs)
 }
 
@@ -539,7 +540,7 @@ fn compact_checkin_logs_at(path: &Path, at_ms: i64) -> std::io::Result<bool> {
 /// read-only operation; both hosts invoke this explicit migration before their
 /// first automatic verification cycle.
 pub fn compact_checkin_logs() -> std::io::Result<bool> {
-    let _guard = CHECKIN_LOG_WRITE_LOCK.lock().unwrap();
+    let _guard = lock_or_recover(&CHECKIN_LOG_WRITE_LOCK);
     compact_checkin_logs_at(&checkin_logs_file(), now_ms())
 }
 
@@ -547,7 +548,7 @@ pub fn compact_checkin_logs() -> std::io::Result<bool> {
 pub fn add_checkin_log(entry: &Value) {
     // Account-scoped check-in coordination permits unrelated accounts to run
     // concurrently. Serialize the file read-modify-write so neither entry is lost.
-    let _guard = CHECKIN_LOG_WRITE_LOCK.lock().unwrap();
+    let _guard = lock_or_recover(&CHECKIN_LOG_WRITE_LOCK);
     let mut logs = load_checkin_logs();
     logs.push(entry.clone());
     let _ = save_checkin_logs_unlocked(&logs);
@@ -827,7 +828,7 @@ fn rotate_notify_count_at(path: &Path, today: &str) -> u32 {
 /// 同自然日上限 [`ROTATE_NOTIFY_DAILY_LIMIT`]，跨日按本地日期清零；读取失败/损坏视为 0，
 /// 不阻塞轮换。预算文件写不进去时不投递——宁可少一条通知，也不要每轮都弹。
 pub fn try_consume_rotate_notify(at_ms: i64) -> bool {
-    let _guard = ROTATE_NOTIFY_LOCK.lock().unwrap();
+    let _guard = lock_or_recover(&ROTATE_NOTIFY_LOCK);
     let path = auto_rotate_notify_file();
     try_consume_rotate_notify_at(&path, &local_date(at_ms))
 }
@@ -907,13 +908,18 @@ pub fn utc_iso() -> String {
 // ---------------------------------------------------------------------------
 
 /// 原子写文件（临时文件 + rename），对照 Python atomic_write。
+///
+/// 落盘的文件里有 `accounts.json` 这类**凭据**（含 access_token），因此 Unix 上临时文件
+/// 直接以 `0600` 创建：`std::fs::write` 走的是 0666 & ~umask（通常 0644），同机其它
+/// 用户可读。rename 保留的是临时文件的权限位，所以覆盖写一次就顺带把旧文件的宽权限收紧。
+/// Windows 由用户目录 ACL 保护，无对应位，不做处理。
 pub fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
     let file_name = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
     let tmp = path.with_file_name(format!("{file_name}.tmp-{}", uuid::Uuid::new_v4().simple()));
-    if let Err(e) = std::fs::write(&tmp, content) {
+    if let Err(e) = write_private(&tmp, content) {
         eprintln!("[atomic] write tmp FAILED: {e}");
         return Err(e);
     }
@@ -924,6 +930,29 @@ pub fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
         return Err(e);
     }
     Ok(())
+}
+
+/// 以「仅本人可读写」的权限新建文件（Unix `0600`）。
+///
+/// 本工具落盘的既有凭据（`accounts.json` 里的 access_token）也有会话正文与备份，
+/// 都不该对同机其它用户可读。`std::fs::write` 走的是 0666 & ~umask（通常 0644），
+/// 所以凡是新建这类文件都从这里走。Windows 由用户目录 ACL 保护，无对应位。
+pub(crate) fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+/// 以「仅本人可读写」的权限写文件。
+fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = create_private_file(path)?;
+    file.write_all(content.as_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -2022,6 +2051,29 @@ mod tests {
         assert!(!try_consume_rotate_notify_at(&path, ""));
         assert!(!path.exists());
         assert!(auto_rotate_notify_file().ends_with(ROTATE_NOTIFY_FILE_NAME));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 凭据写盘必须是「仅本人可读写」：accounts.json 里有全部账号的 access_token，
+    /// 默认 `fs::write` 会落成 0644，同机其它用户直接可读。
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_creates_private_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("wb-atomic-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("accounts.json");
+        atomic_write(&path, "{\"a\":1}").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "凭据文件必须只有本人可读写，实际 {mode:o}");
+
+        // 覆盖写也要收紧：先把文件放宽到 0644，再写一次。
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        atomic_write(&path, "{\"a\":2}").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "覆盖写后权限应回到 0600，实际 {mode:o}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"a\":2}");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

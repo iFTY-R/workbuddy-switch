@@ -164,7 +164,8 @@ pub fn durable_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         .unwrap_or_default();
     let tmp = path.with_file_name(format!("{file_name}.tmp-{}", uuid::Uuid::new_v4().simple()));
     let result = (|| -> std::io::Result<()> {
-        let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        // 会话正文与备份都属于私密内容：Unix 上按 0600 新建，别让同机其它用户读到。
+        let mut file = crate::modules::config::create_private_file(&tmp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);

@@ -9,13 +9,16 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::{Query, RawQuery};
+use axum::extract::{Query, RawQuery, Request};
 use axum::http::{header, StatusCode, Uri};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+
 use rust_embed::RustEmbed;
 use serde_json::{json, Value};
+use wb_switch_core::modules::lock_or_recover;
 
 use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
@@ -26,22 +29,30 @@ use wb_switch_core::modules::{
 };
 
 /// WorkBuddy 运行状态缓存：Windows 上检测要跑 tasklist（慢），缓存几秒避免
-/// 前端切 tab 频繁触发命令行导致卡顿/闪窗。按档位分别缓存。
+/// 前端切 tab 频繁触发命令行导致卡顿/闪窗。**按档位各占一格**——单槽会把
+/// cn/ai 交替查询互相冲掉，等于缓存失效。
 #[cfg(target_os = "windows")]
-static RUNNING_CACHE: Mutex<Option<(Instant, bool, WbVariant)>> = Mutex::new(None);
+static RUNNING_CACHE: Mutex<[Option<(Instant, bool)>; 2]> = Mutex::new([None, None]);
+
+/// 档位在运行状态缓存里的下标。
+#[cfg(target_os = "windows")]
+fn running_cache_slot(variant: WbVariant) -> usize {
+    usize::from(variant == WbVariant::Ai)
+}
 
 fn cached_workbuddy_running(variant: WbVariant) -> bool {
     #[cfg(target_os = "windows")]
     {
-        let mut cache = RUNNING_CACHE.lock().unwrap();
-        if let Some((t, v, cached_variant)) = cache.as_ref() {
-            if *cached_variant == variant && t.elapsed() < Duration::from_secs(3) {
-                return *v;
+        let slot = running_cache_slot(variant);
+        let mut cache = lock_or_recover(&RUNNING_CACHE);
+        if let Some((t, running)) = cache[slot] {
+            if t.elapsed() < Duration::from_secs(3) {
+                return running;
             }
         }
-        let v = process::is_workbuddy_running(variant);
-        *cache = Some((Instant::now(), v, variant));
-        v
+        let running = process::is_workbuddy_running(variant);
+        cache[slot] = Some((Instant::now(), running));
+        running
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -56,6 +67,79 @@ struct Assets;
 /// 切换进度缓存：webui 通过 GET /api/switch/progress 轮询。
 static SWITCH_PROGRESS: Mutex<Option<String>> = Mutex::new(None);
 static SWITCH_RUNNING: Mutex<bool> = Mutex::new(false);
+
+/// 允许访问本服务的 Host 主机名（端口忽略）。服务只 bind `127.0.0.1`，
+/// 正常访问只会来自这三个名字。
+const LOOPBACK_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "::1"];
+
+/// 从 `Host` 或 `Origin` 取值里解析主机名：兼容完整 URL（`http://host:port/path`）、
+/// 去端口与 IPv6 方括号、统一小写。解析不出主机名返回 `None`。
+fn host_name(authority: &str) -> Option<String> {
+    let trimmed = authority.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // `Origin` 是完整 URL，`Host` 只有 authority。
+    let rest = match trimmed.split_once("://") {
+        Some((_, tail)) => tail,
+        None => trimmed,
+    };
+    let rest = rest.split(['/', '?', '#']).next().unwrap_or(rest).trim();
+    if rest.is_empty() {
+        return None;
+    }
+    // IPv6：[::1]:8080 或 [::1]
+    if let Some(inner) = rest.strip_prefix('[') {
+        let (name, tail) = inner.split_once(']')?;
+        if !tail.is_empty() && !tail.starts_with(':') {
+            return None;
+        }
+        return (!name.is_empty()).then(|| name.to_ascii_lowercase());
+    }
+    let name = rest.split(':').next()?.trim();
+    (!name.is_empty()).then(|| name.to_ascii_lowercase())
+}
+
+/// 该 authority 是否指向本机回环地址。
+fn is_loopback_authority(authority: &str) -> bool {
+    host_name(authority).is_some_and(|name| LOOPBACK_HOSTS.contains(&name.as_str()))
+}
+
+/// 本机来源校验：`Host` 必须是回环名；请求带 `Origin` 时，其主机名也必须是回环名。
+///
+/// 服务只 bind 127.0.0.1 不等于「只有本机能访问」：浏览器的 DNS rebinding 能让
+/// 攻击者页面以同源身份打到 `127.0.0.1:port`，此时 `Host` 是攻击者域名——只认回环名
+/// 即可把这一整类攻击挡住。`Origin` 再兜一层跨站请求（含 `Origin: null`）。
+/// 无论 Desktop 还是 webui，页面本身就是从 `127.0.0.1` / `localhost` 加载的，
+/// 因此正常请求不受影响。
+async fn guard_local_origin(req: Request, next: Next) -> Response {
+    if !req
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(is_loopback_authority)
+    {
+        return reject_origin("只接受通过 127.0.0.1 / localhost 访问");
+    }
+    if let Some(origin) = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+    {
+        if !is_loopback_authority(origin) {
+            return reject_origin("拒绝来自其它站点的请求");
+        }
+    }
+    next.run(req).await
+}
+
+fn reject_origin(reason: &str) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({ "ok": false, "error": reason })),
+    )
+        .into_response()
+}
 
 pub fn router() -> Router {
     Router::new()
@@ -224,6 +308,7 @@ pub fn router() -> Router {
             get(api_update_config).post(api_save_update_config),
         )
         .fallback(static_handler)
+        .layer(middleware::from_fn(guard_local_origin))
 }
 
 fn json_ok(v: Value) -> Response {
@@ -836,16 +921,20 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
     };
 
     {
-        let mut running = SWITCH_RUNNING.lock().unwrap();
+        let mut running = lock_or_recover(&SWITCH_RUNNING);
         if *running {
             return json_err("已有切换任务进行中".to_string(), StatusCode::CONFLICT);
         }
         *running = true;
-        *SWITCH_PROGRESS.lock().unwrap() = Some("开始切换账号…".to_string());
+        *lock_or_recover(&SWITCH_PROGRESS) = Some("开始切换账号…".to_string());
     }
+    // 复位必须挂在 Drop 上：客户端断开连接时 axum 会直接 drop 本 handler 的 future，
+    // 写在 `.await` 之后的复位语句就永远跑不到，运行标志会一直为 true ——
+    // 之后每次切换都 409「已有切换任务进行中」，只能重启服务。
+    let _run_guard = SwitchRunGuard;
 
     let progress: switch::ProgressFn = Box::new(|msg| {
-        *SWITCH_PROGRESS.lock().unwrap() = Some(msg.to_string());
+        *lock_or_recover(&SWITCH_PROGRESS) = Some(msg.to_string());
     });
 
     let result = tokio::task::spawn_blocking(move || {
@@ -860,8 +949,6 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
     })
     .await;
 
-    *SWITCH_RUNNING.lock().unwrap() = false;
-
     match result {
         Ok(Ok(v)) => json_ok(v),
         Ok(Err(e)) => json_err(e, StatusCode::BAD_REQUEST),
@@ -869,9 +956,18 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
     }
 }
 
+/// 切换运行标志的守卫：离开作用域（含 future 被 drop）即复位。
+struct SwitchRunGuard;
+
+impl Drop for SwitchRunGuard {
+    fn drop(&mut self) {
+        *lock_or_recover(&SWITCH_RUNNING) = false;
+    }
+}
+
 async fn api_switch_progress() -> Response {
-    let p = SWITCH_PROGRESS.lock().unwrap().clone();
-    let running = *SWITCH_RUNNING.lock().unwrap();
+    let p = lock_or_recover(&SWITCH_PROGRESS).clone();
+    let running = *lock_or_recover(&SWITCH_RUNNING);
     json_ok(json!({ "running": running, "progress": p }))
 }
 
@@ -1694,7 +1790,10 @@ async fn api_clear_notifications() -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{body_variant, checkin_status_item, query_variant, static_handler};
+    use super::{
+        body_variant, checkin_status_item, host_name, is_loopback_authority, query_variant,
+        static_handler,
+    };
     use axum::http::{header, StatusCode, Uri};
     use serde_json::json;
     use wb_switch_core::modules::variant::WbVariant;
@@ -1790,5 +1889,41 @@ mod tests {
 
         assert_eq!(item["variant"], "ai");
         assert_eq!(item["statusUnsupported"], true);
+    }
+
+    /// 本机来源校验：只认回环主机名，且**不做后缀/包含匹配**——`127.0.0.1.evil.com`
+    /// 这类域名必须被拒（DNS rebinding 的典型构造）。
+    #[test]
+    fn local_origin_guard_accepts_only_loopback_names() {
+        for ok in [
+            "127.0.0.1",
+            "127.0.0.1:8080",
+            "localhost",
+            "LOCALHOST:1420",
+            "[::1]:8080",
+            "[::1]",
+            "http://127.0.0.1:8080",
+            "https://localhost:443",
+        ] {
+            assert!(is_loopback_authority(ok), "{ok} 应被放行");
+        }
+        for bad in [
+            "",
+            " ",
+            "evil.com:8080",
+            "127.0.0.1.evil.com",
+            "127.0.0.1.evil.com:8080",
+            "192.168.1.2:8080",
+            "0.0.0.0:8080",
+            "http://evil.com",
+            "https://localhost.evil.com",
+            "null",
+            "[::1]evil",
+        ] {
+            assert!(!is_loopback_authority(bad), "{bad} 必须被拒");
+        }
+        assert_eq!(host_name("[::1]:8080").as_deref(), Some("::1"));
+        assert_eq!(host_name("LocalHost:1").as_deref(), Some("localhost"));
+        assert_eq!(host_name(""), None);
     }
 }

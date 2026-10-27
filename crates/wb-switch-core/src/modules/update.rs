@@ -16,6 +16,7 @@ use std::sync::Mutex;
 use crate::modules::config::{
     atomic_write, http_request_raw, http_request_with_proxy, now_secs, store_dir,
 };
+use crate::modules::lock_or_recover;
 
 /// 应用当前版本（来自 Cargo.toml package.version）。
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -230,7 +231,7 @@ async fn fetch_latest_tag(
 /// 不发网络请求。主端点 manifest 失败时自动走 302 兜底；两个端点都失败返回可读错误。
 pub async fn update_check(proxy: Option<&str>, force: bool) -> Value {
     if !force {
-        if let Some(cached) = CACHE.lock().unwrap().as_ref() {
+        if let Some(cached) = lock_or_recover(&CACHE).as_ref() {
             if now_secs() - cached.checked_at < CACHE_TTL_SECS {
                 return cached.value.clone();
             }
@@ -286,7 +287,7 @@ pub async fn update_check(proxy: Option<&str>, force: bool) -> Value {
             "publishedAt": published_at,
             "checkedAt": now_secs(),
         });
-        *CACHE.lock().unwrap() = Some(CachedCheck {
+        *lock_or_recover(&CACHE) = Some(CachedCheck {
             checked_at: now_secs(),
             value: value.clone(),
         });
@@ -307,7 +308,7 @@ pub async fn update_check(proxy: Option<&str>, force: bool) -> Value {
                 "releaseUrl": release_url,
                 "checkedAt": now_secs(),
             });
-            *CACHE.lock().unwrap() = Some(CachedCheck {
+            *lock_or_recover(&CACHE) = Some(CachedCheck {
                 checked_at: now_secs(),
                 value: value.clone(),
             });

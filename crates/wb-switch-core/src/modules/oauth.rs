@@ -8,6 +8,7 @@ use std::sync::{Mutex, OnceLock};
 
 use crate::modules::account;
 use crate::modules::config::{http_request, norm_ts, now_ms, now_secs, OAUTH_TIMEOUT_SECONDS};
+use crate::modules::lock_or_recover;
 use crate::modules::variant::WbVariant;
 
 struct OAuthInfo {
@@ -82,7 +83,7 @@ pub async fn oauth_start(variant: WbVariant) -> Result<Value, String> {
         .map(|s| s.to_string())
         .unwrap_or_else(|| format!("{}/login?state={state}", variant.api_endpoint()));
 
-    let mut map = oauth_states().lock().unwrap();
+    let mut map = lock_or_recover(oauth_states());
     map.insert(
         login_id.clone(),
         OAuthInfo {
@@ -105,7 +106,7 @@ pub async fn oauth_start(variant: WbVariant) -> Result<Value, String> {
 
 /// 结束一次轮询并把错误写回 state（供重复轮询与前端读取）。
 fn fail_oauth(login_id: &str, error: String) -> Value {
-    let mut map = oauth_states().lock().unwrap();
+    let mut map = lock_or_recover(oauth_states());
     if let Some(info) = map.get_mut(login_id) {
         info.done = true;
         info.error = Some(error.clone());
@@ -134,7 +135,7 @@ fn domain_mismatch_error(variant: WbVariant, domain: &str) -> Option<String> {
 /// 轮询一次官方 token 接口。成功则拉取账号信息并入库。
 pub async fn oauth_poll(login_id: &str) -> Value {
     let (state, variant) = {
-        let mut map = oauth_states().lock().unwrap();
+        let mut map = lock_or_recover(oauth_states());
         let Some(info) = map.get_mut(login_id) else {
             return json!({"done": true, "error": "登录请求不存在"});
         };
@@ -252,7 +253,7 @@ pub async fn oauth_poll(login_id: &str) -> Value {
         Ok(saved) => saved,
         Err(error) => {
             let error = format!("保存账号失败: {error}");
-            let mut map = oauth_states().lock().unwrap();
+            let mut map = lock_or_recover(oauth_states());
             if let Some(info) = map.get_mut(login_id) {
                 info.done = true;
                 info.error = Some(error.clone());
@@ -262,7 +263,7 @@ pub async fn oauth_poll(login_id: &str) -> Value {
     };
 
     let result = account::account_meta(&account);
-    let mut map = oauth_states().lock().unwrap();
+    let mut map = lock_or_recover(oauth_states());
     if let Some(info) = map.get_mut(login_id) {
         info.done = true;
         info.result = Some(result.clone());

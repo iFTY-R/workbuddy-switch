@@ -168,7 +168,12 @@ async fn serve(args: &[String]) {
 
     spawn_background_loops();
 
-    axum::serve(listener, app).await.unwrap();
+    // 不用 unwrap：服务在运行期出错（监听被抢占、连接层异常）时应给出可读提示，
+    // 而不是把 panic backtrace 甩给用户。
+    if let Err(error) = axum::serve(listener, app).await {
+        eprintln!("服务异常退出：{error}");
+        std::process::exit(1);
+    }
 }
 
 fn open_browser(addr: &str) {

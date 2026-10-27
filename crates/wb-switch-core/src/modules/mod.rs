@@ -37,3 +37,12 @@ pub mod vscode_ext;
 pub mod vscode_session;
 pub mod vscode_session_link;
 pub mod vscode_session_sync;
+
+/// 取互斥锁，**中毒也继续用**。
+///
+/// 这些锁保护的都是缓存/日志/运行标志这类可重建状态：临界区里 panic 过不代表数据
+/// 结构从此不可用，而 `lock().unwrap()` 会把一次 panic 变成「此后每次访问都 panic」。
+/// 对本地服务尤其致命——一个 handler 崩过，后续所有请求都 500，只能重启进程。
+pub fn lock_or_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poison| poison.into_inner())
+}

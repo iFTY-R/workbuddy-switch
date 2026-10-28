@@ -5,9 +5,12 @@ import { toast } from "sonner";
 import { CodeBuddyCnIdeMark, VscodeExtMark, WorkBuddyAiMark, WorkBuddyMark } from "@/components/product-marks";
 import { DemoAction } from "@/components/demo-action";
 import { GroupDetailPanel } from "@/components/session-group-detail";
+import { SessionBatchBar } from "@/components/session-batch-bar";
+import { SessionBatchDialog } from "@/components/session-batch-dialog";
 import { SessionTreeList } from "@/components/session-tree";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Card, CardContent } from "@/components/ui/card";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
@@ -18,11 +21,15 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { displayName } from "@/lib/account-display";
 import * as api from "@/lib/api";
-import type { AccountMeta, Session, SessionGroupClient, SessionGroupCurrentAccount, SessionGroupDetail, SessionGroupMemberDetail, SessionGroupSummary, SessionGroupUnifyPlan, SessionSyncMode, WbVariant } from "@/lib/types";
+import { jobCounts, planPreview, rangeSelection, reportToCsv, selectedTargets } from "@/lib/session-batch";
+import { useSessionBatch } from "@/lib/use-session-batch";
+import type { AccountMeta, Session, SessionBatchJob, SessionBatchOp, SessionBatchTarget, SessionGroupClient, SessionGroupCurrentAccount, SessionGroupDetail, SessionGroupMemberDetail, SessionGroupSummary, SessionGroupUnifyPlan, SessionSyncMode, WbVariant } from "@/lib/types";
 import { accountVariant, variantLabel } from "@/lib/variant";
 import { useAccountsStore } from "@/stores/accounts";
 
 const PAGE_SIZE = 8;
+/** 「上次批量未完成」提示被用户忽略后记在这里：同一份报告不再反复出现。 */
+const DISMISSED_BATCH_KEY = "wb.batch.dismissedJobId";
 /** 列表不超过该数量时隐藏底部分页条：一页装得下，去掉更清爽。 */
 const PAGINATION_HIDE_MAX = 4;
 const CLIENTS: { id: SessionGroupClient; title: string; description: string }[] = [
@@ -60,6 +67,17 @@ export default function SessionsPage() {
   const [contentWidth, setContentWidth] = useState(0);
   /** 插件侧「VS Code 运行中」的确认框：确认后执行 `run`（带 restart），取消则丢弃。 */
   const [restartPrompt, setRestartPrompt] = useState<{ actionLabel: string; run: () => Promise<void> } | null>(null);
+  /** 批量选择：按 `key`（client:scope:groupId）保存，跨分页有效，换筛选也不丢。 */
+  const [selectedKeys, setSelectedKeys] = useState<Set<string>>(new Set());
+  const [batchOp, setBatchOp] = useState<SessionBatchOp>("sync");
+  const [batchOpen, setBatchOpen] = useState(false);
+  const [allowBatchRestart, setAllowBatchRestart] = useState(false);
+  /** 连选锚点：按住 Shift 点选时，从这里按屏幕顺序取区间。 */
+  const batchAnchor = useRef<string | null>(null);
+  /** 上次未跑完的批量（来自落盘报告）：列表顶部提示一次，可点开查看/重试。 */
+  const [lastReport, setLastReport] = useState<SessionBatchJob | null>(null);
+  const adoptedJobId = useRef<string | null>(null);
+  const batch = useSessionBatch();
   const rootRef = useRef<HTMLDivElement>(null);
   const openerRef = useRef<HTMLElement | null>(null);
   const detailMode = "modal";
@@ -124,6 +142,21 @@ export default function SessionsPage() {
   useEffect(() => {
     if (accounts.length === 0) void fetchAll();
   }, [accounts.length, fetchAll]);
+
+  // 上次批量如果留下中断/失败/未执行项，进页面就提示（报告是落盘的，重启进程也在）。
+  // 由后端挑「最近未完成」：最新一份往往是成功的小批量，不该因此把更早的问题藏掉。
+  useEffect(() => {
+    let live = true;
+    api.sessionBatchLatestIncomplete()
+      .then((report) => {
+        if (!live || !report) return;
+        // 「忽略」是持久的：同一份报告不再反复打扰，除非它换了。
+        if (localStorage.getItem(DISMISSED_BATCH_KEY) === report.jobId) return;
+        setLastReport(report);
+      })
+      .catch(() => { /* 历史报告只是提示，读不到不影响主流程 */ });
+    return () => { live = false; };
+  }, []);
 
   const reloadGroups = useCallback(async () => {
     const key = `${client}:${scope ?? "all"}`;
@@ -222,8 +255,137 @@ export default function SessionsPage() {
   const pageCount = Math.max(1, Math.ceil(filteredGroups.length / PAGE_SIZE));
   const currentPage = Math.min(page, pageCount);
   const visibleGroups = filteredGroups.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
+  /** 批量当前只对 WorkBuddy 开放（其它客户端还有各自编辑器/IDE 的运行门禁）。 */
+  const batchEnabled = client === "workbuddy";
+  const visibleKeys = visibleGroups.map((group) => group.key);
+  /** 选中项里有几个不在当前筛选结果内：换筛选后选择保留，但要明确告知。 */
+  const selectedHidden = selectedKeys.size - filteredGroups.filter((group) => selectedKeys.has(group.key)).length;
+  const pageAllSelected = visibleKeys.length > 0 && visibleKeys.every((key) => selectedKeys.has(key));
+  const allFilteredSelected = filteredGroups.length > 0 && filteredGroups.every((group) => selectedKeys.has(group.key));
+  const batchPreview = useMemo(() => planPreview(groups, selectedKeys), [groups, selectedKeys]);
 
   useEffect(() => { setPage(1); }, [statusFilter, sortOrder, client, scope]);
+
+  // 换客户端/档位后旧选择不再有意义；连带作废在途任务视图（后端 job 仍在跑，只是不再展示）。
+  useEffect(() => {
+    setSelectedKeys(new Set());
+    batchAnchor.current = null;
+    batch.reset();
+    setBatchOpen(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [client, scope]);
+
+  // Ctrl/Cmd+A：全选当前筛选结果（弹窗打开、输入框聚焦时不抢键）。
+  useEffect(() => {
+    if (!batchEnabled) return;
+    function onKeyDown(event: KeyboardEvent) {
+      if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "a") return;
+      if (batchOpen) return;
+      const target = event.target as HTMLElement | null;
+      if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
+      event.preventDefault();
+      setSelectedKeys(new Set(filteredGroups.map((group) => group.key)));
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [batchEnabled, batchOpen, filteredGroups]);
+
+  // 任务结束后刷新列表（状态徽标要跟着变），并只提示一次。
+  const finishedJob = batch.job && (batch.job.state === "finished" || batch.job.state === "interrupted")
+    ? batch.job
+    : null;
+  const finishedJobId = finishedJob?.jobId ?? null;
+  useEffect(() => {
+    if (!finishedJobId || !finishedJob) return;
+    void reloadGroups();
+    if (adoptedJobId.current === finishedJobId) {
+      adoptedJobId.current = null;
+      return;
+    }
+    const counts = jobCounts(finishedJob);
+    if (finishedJob.state === "interrupted") {
+      toast.warning("上次批量被中断", { description: "进程退出时还没跑完，可在结果里查看最后一次记录并重试失败项" });
+    } else if (finishedJob.aborted) {
+      toast.error("批量已中止", { description: finishedJob.aborted });
+    } else if (finishedJob.cancelled) {
+      toast.info("批量已停止", { description: `完成 ${counts.done} 项，未执行 ${counts.notRun} 项` });
+    } else if (counts.failed > 0) {
+      toast.warning(`批量完成，${counts.failed} 项失败`, { description: `完成 ${counts.done} 项 · 跳过 ${counts.skipped} 项` });
+      setLastReport(finishedJob);
+    } else {
+      toast.success(`批量完成：${counts.done} 项`, { description: counts.skipped > 0 ? `跳过 ${counts.skipped} 项` : undefined });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [finishedJobId]);
+
+  function clearBatchSelection() {
+    setSelectedKeys(new Set());
+    batchAnchor.current = null;
+  }
+
+  /** 点选 / 连选：Shift 时按屏幕顺序取区间，普通点击只切自己。 */
+  function toggleGroupSelection(group: SessionGroupSummary, shiftKey: boolean) {
+    setSelectedKeys((prev) => {
+      if (shiftKey) {
+        return rangeSelection(filteredGroups.map((item) => item.key), batchAnchor.current, group.key, prev);
+      }
+      const next = new Set(prev);
+      if (next.has(group.key)) next.delete(group.key);
+      else next.add(group.key);
+      return next;
+    });
+    batchAnchor.current = group.key;
+  }
+
+  function togglePageSelection() {
+    setSelectedKeys((prev) => {
+      const next = new Set(prev);
+      visibleKeys.forEach((key) => {
+        if (pageAllSelected) next.delete(key);
+        else next.add(key);
+      });
+      return next;
+    });
+  }
+
+  /** 导出本次报告：桌面端走保存对话框写盘，webui 走浏览器下载。 */
+  async function exportBatchReport(job: SessionBatchJob) {
+    try {
+      const csv = reportToCsv(job);
+      const filename = `workbuddy-batch-${job.op}-${job.jobId.slice(0, 8)}.csv`;
+      if (api.isWebui()) {
+        const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+        return;
+      }
+      const { save } = await import("@tauri-apps/plugin-dialog");
+      const path = await save({ defaultPath: filename, filters: [{ name: "CSV", extensions: ["csv"] }] });
+      if (!path) return;
+      await api.saveTextFile(path, csv);
+      toast.success("报告已导出", { description: path });
+    } catch (error) {
+      toast.error("导出报告失败", { description: api.asError(error) });
+    }
+  }
+
+  function openBatch(op: SessionBatchOp) {
+    if (client !== "workbuddy" || selectedKeys.size === 0) return;
+    setBatchOp(op);
+    setAllowBatchRestart(false);
+    batch.reset();
+    setBatchOpen(true);
+  }
+
+  async function startBatch(op: SessionBatchOp, targets: SessionBatchTarget[], allowRestart: boolean) {
+    await batch.start({ op, client, groups: targets, variantScope: scope, allowRestart });
+  }
 
   function changeClient(value: string) {
     const next = value as SessionGroupClient;
@@ -492,7 +654,7 @@ export default function SessionsPage() {
       currentAccounts={currentAccounts}
       setSourceMemberId={setSourceMemberId}
       addTargetId={addTargetId} setAddTargetId={setAddTargetId}
-      unifyPlan={unifyPlan} unifyLoading={unifyLoading} setUnifyPlan={setUnifyPlan} busy={actionBusy || detailLoading || !!detailError}
+      unifyPlan={unifyPlan} unifyLoading={unifyLoading} setUnifyPlan={setUnifyPlan} busy={actionBusy || detailLoading || !!detailError || batch.running}
       error={detailError} loading={detailLoading} onClose={closeDetail}
       onRetry={() => { setDetailError(null); void reloadSelectedGroup(); }}
       onPrepareUnify={prepareUnify} onConfirmUnify={confirmUnify} onBatchSync={syncSafeBatch} onAdd={addMember}
@@ -551,7 +713,41 @@ export default function SessionsPage() {
           </div>
           {(storeStatus === "unavailable" || storeError) && <p role="status" className="mb-3 rounded-lg border border-amber-500/30 p-3 text-sm text-muted-foreground">{storeError ?? "关联组存储暂不可用，当前只展示可读取的数据。"}</p>}
           {loadError && <div role="alert" className="mb-3 rounded-lg border border-destructive/30 p-3 text-sm text-destructive">{loadError}<Button variant="outline" size="sm" className="ml-2" onClick={() => void reloadGroups()}>重试</Button></div>}
-          {loading ? <GroupSkeleton /> : filteredGroups.length === 0 ? <div className="flex min-h-56 flex-col items-center justify-center rounded-xl border border-dashed p-6 text-center"><Layers3 className="size-7 text-muted-foreground" /><h3 className="mt-3 text-sm font-medium">{groups.length === 0 ? "还没有关联会话组" : "没有符合条件的会话"}</h3><p className="mt-2 text-sm text-muted-foreground">{groups.length === 0 ? "从账号切换时复制会话后，关联组会显示在这里。" : "试试其它筛选条件。"}</p></div> : <div className={`grid min-w-0 gap-3 ${contentWidth >= 600 ? "grid-cols-2" : "grid-cols-1"}`}>{visibleGroups.map((group) => <SessionGroupCard key={group.key} group={group} selected={group.groupId === selectedGroupId} onSelect={() => openDetail(group.groupId)} onRequestDelete={() => setDeleteTarget(group)} />)}</div>}
+          {lastReport && !batchOpen && (
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-sm">
+              <span className="min-w-0 text-muted-foreground">
+                上次批量（{jobCounts(lastReport).done} 完成 / {jobCounts(lastReport).failed} 失败 / {jobCounts(lastReport).notRun} 未执行）没有全部完成
+              </span>
+              <span className="flex shrink-0 gap-1">
+                <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" onClick={() => {
+                  adoptedJobId.current = lastReport.jobId;
+                  setBatchOp(lastReport.op);
+                  batch.adopt(lastReport);
+                  setBatchOpen(true);
+                }}>查看结果</Button>
+                <Button variant="ghost" size="sm" className="h-7 px-2 text-xs text-muted-foreground" onClick={() => {
+                  localStorage.setItem(DISMISSED_BATCH_KEY, lastReport.jobId);
+                  setLastReport(null);
+                }}>忽略</Button>
+              </span>
+            </div>
+          )}
+          {batchEnabled && selectedKeys.size > 0 && (
+            <SessionBatchBar
+              selectedCount={selectedKeys.size}
+              hiddenCount={Math.max(0, selectedHidden)}
+              pageAllSelected={pageAllSelected}
+              allSelected={allFilteredSelected}
+              filteredCount={filteredGroups.length}
+              busy={actionBusy || batch.running}
+              onTogglePage={togglePageSelection}
+              onSelectAll={() => setSelectedKeys(new Set(filteredGroups.map((group) => group.key)))}
+              onClear={clearBatchSelection}
+              onSync={() => openBatch("sync")}
+              onDelete={() => openBatch("delete")}
+            />
+          )}
+          {loading ? <GroupSkeleton /> : filteredGroups.length === 0 ? <div className="flex min-h-56 flex-col items-center justify-center rounded-xl border border-dashed p-6 text-center"><Layers3 className="size-7 text-muted-foreground" /><h3 className="mt-3 text-sm font-medium">{groups.length === 0 ? "还没有关联会话组" : "没有符合条件的会话"}</h3><p className="mt-2 text-sm text-muted-foreground">{groups.length === 0 ? "从账号切换时复制会话后，关联组会显示在这里。" : "试试其它筛选条件。"}</p></div> : <div className={`grid min-w-0 gap-3 ${contentWidth >= 600 ? "grid-cols-2" : "grid-cols-1"}`}>{visibleGroups.map((group) => <SessionGroupCard key={group.key} group={group} selected={group.groupId === selectedGroupId} selectable={batchEnabled} checked={selectedKeys.has(group.key)} onToggleSelect={(shiftKey) => toggleGroupSelection(group, shiftKey)} onSelect={() => openDetail(group.groupId)} onRequestDelete={() => setDeleteTarget(group)} />)}</div>}
           {!loading && filteredGroups.length > PAGINATION_HIDE_MAX && <div className="mt-6 flex flex-wrap items-center justify-between gap-3 text-xs text-muted-foreground"><span>显示 {(currentPage - 1) * PAGE_SIZE + 1}–{Math.min(currentPage * PAGE_SIZE, filteredGroups.length)}，共 {filteredGroups.length} 个会话</span><nav aria-label="会话分页" className="flex flex-wrap items-center gap-1.5"><Button variant="outline" size="icon" className="size-8" aria-label="上一页" disabled={currentPage <= 1} onClick={() => setPage(currentPage - 1)}><ChevronLeft /></Button>{pages.map((value, index) => <span key={value} className="flex items-center gap-1.5">{index > 0 && value - pages[index - 1] > 1 && <span>…</span>}<Button variant={value === currentPage ? "default" : "outline"} className={`size-8 p-0 ${value === currentPage ? "bg-brand text-brand-foreground hover:bg-brand/90" : ""}`} aria-label={`第 ${value} 页`} aria-current={value === currentPage ? "page" : undefined} onClick={() => setPage(value)}>{value}</Button></span>)}<Button variant="outline" size="icon" className="size-8" aria-label="下一页" disabled={currentPage >= pageCount} onClick={() => setPage(currentPage + 1)}><ChevronRight /></Button></nav></div>}
         </section>
       </div>
@@ -591,6 +787,29 @@ export default function SessionsPage() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+      <SessionBatchDialog
+        open={batchOpen}
+        onOpenChange={(open) => { if (!open) { setBatchOpen(false); batch.reset(); } }}
+        op={batchOp}
+        groups={groups}
+        selected={selectedKeys}
+        preview={batchPreview}
+        job={batch.job}
+        error={batch.error}
+        starting={batch.starting}
+        allowRestart={allowBatchRestart}
+        onAllowRestartChange={setAllowBatchRestart}
+        onStart={() => void startBatch(batchOp, selectedTargets(groups, selectedKeys), allowBatchRestart)}
+        onCancelRun={() => void batch.cancel()}
+        onExport={(job) => void exportBatchReport(job)}
+        onRetryFailed={(targets) => {
+          // 重试只提交失败/未执行的项：选择集同步收窄，否则计划弹窗显示的是旧的全选数量。
+          setSelectedKeys(new Set(targets.map((target) => target.key)));
+          batch.reset();
+          void startBatch(batchOp, targets, allowBatchRestart);
+        }}
+        onDone={() => { setBatchOpen(false); clearBatchSelection(); void reloadGroups(); }}
+      />
     </div>
   );
 }
@@ -920,10 +1139,29 @@ function GroupSkeleton() {
   </div>;
 }
 
-function SessionGroupCard({ group, selected, onSelect, onRequestDelete }: { group: SessionGroupSummary; selected: boolean; onSelect: () => void; onRequestDelete: () => void }) {
-  // 「…」不能嵌在整卡按钮里（button 不能嵌套 button），所以绝对定位到卡片右上角。
+function SessionGroupCard({ group, selected, selectable, checked, onToggleSelect, onSelect, onRequestDelete }: {
+  group: SessionGroupSummary;
+  selected: boolean;
+  /** 当前客户端是否支持批量（不支持时不渲染复选框，避免给出做不到的操作）。 */
+  selectable: boolean;
+  checked: boolean;
+  /** `shiftKey` 为真表示连选（按屏幕顺序从锚点取区间）。 */
+  onToggleSelect: (shiftKey: boolean) => void;
+  onSelect: () => void;
+  onRequestDelete: () => void;
+}) {
+  // 复选框与「…」都不能嵌在整卡按钮里（button 不能嵌套 button），所以都绝对定位。
   return <div className="relative min-w-0">
-    <button type="button" onClick={onSelect} aria-pressed={selected} className={`w-full min-w-0 cursor-pointer rounded-lg border bg-card px-4 py-3.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${selected ? "border-brand shadow-sm" : "border-border hover:border-brand/50"}`}>
+    {selectable && (
+      <span className="absolute left-2 top-2.5 z-10 flex items-center">
+        <Checkbox
+          checked={checked}
+          aria-label={`选择「${group.title}」`}
+          onCheckedChange={() => onToggleSelect(false)}
+        />
+      </span>
+    )}
+    <button type="button" onClick={(event) => { if (selectable && event.shiftKey) { event.preventDefault(); onToggleSelect(true); return; } onSelect(); }} aria-pressed={selected} className={`w-full min-w-0 cursor-pointer rounded-lg border bg-card py-3.5 ${selectable ? "pl-9" : "pl-4"} pr-4 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${checked ? "border-brand/60 bg-brand/[0.03]" : ""} ${selected ? "border-brand shadow-sm" : "border-border hover:border-brand/50"}`}>
       <div className="flex min-w-0 items-center justify-between gap-2 pr-7 text-xs text-muted-foreground"><span className="flex min-w-0 items-center gap-2"><Folder className="size-4 shrink-0" /><span className="truncate" title={group.projectLabel}>{group.projectLabel || "未标记项目"}</span></span><span className="shrink-0" title={formatDate(group.latestActivityAt)}>{relativeDate(group.latestActivityAt)}</span></div>
       <h3 className="my-3 truncate text-base font-semibold" title={group.title}>{group.title}</h3>
       <div className="flex flex-wrap items-center justify-between gap-2 text-sm text-muted-foreground"><span className="flex items-center gap-2" title={group.accountNames.join("、")}><MessageCircle className="size-4" />{group.memberCount} 个账号</span><span className="flex min-w-0 items-center gap-2 text-xs"><span className={`size-2 shrink-0 rounded-full ${group.summaryStatus === "latest" ? "bg-brand" : group.summaryStatus === "behind" ? "bg-amber-500" : group.summaryStatus === "diverge" ? "bg-destructive" : "bg-muted-foreground"}`} /><span className="truncate" title={group.summaryText}>{{ latest: "内容一致", behind: "待同步", diverge: "有分歧", missing: "内容缺失", unknown: "无法确认" }[group.summaryStatus]}</span></span></div>

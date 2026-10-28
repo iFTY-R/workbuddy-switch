@@ -30,6 +30,8 @@ import type {
   RotateStatus,
   Session,
   SessionCopyReport,
+  SessionBatchJob,
+  SessionBatchTarget,
   SessionLinksPreview,
   SessionSyncReport,
   SessionSyncSelection,
@@ -161,6 +163,12 @@ const ROUTES: Record<string, Route> = {
   vscode_restart_precheck: { method: "POST", path: "/api/vscode-ext/restart-precheck" },
   unlink_session_group_member: { method: "POST", path: "/api/session-groups/unlink" },
   delete_session_group: { method: "POST", path: "/api/session-groups/delete" },
+  start_session_batch_sync: { method: "POST", path: "/api/session-groups/batch-sync" },
+  start_session_batch_delete: { method: "POST", path: "/api/session-groups/batch-delete" },
+  session_batch_progress: { method: "POST", path: "/api/session-groups/batch-progress" },
+  session_batch_cancel: { method: "POST", path: "/api/session-groups/batch-cancel" },
+  session_batch_reports: { method: "POST", path: "/api/session-groups/batch-reports" },
+  session_batch_latest_incomplete: { method: "POST", path: "/api/session-groups/batch-latest-incomplete" },
   get_checkin_status: { method: "GET", path: "/api/checkin/status" },
   get_credit_expiry: { method: "POST", path: "/api/credits" },
   get_credit_statistics: { method: "GET", path: "/api/credits/stats" },
@@ -1134,4 +1142,69 @@ export function getErrorLogPath(): Promise<string> {
 export function revealErrorLog(): Promise<void> {
   if (demoModeEnabled || isWebui()) return Promise.resolve();
   return call<unknown>("reveal_error_log").then(() => undefined);
+}
+
+/**
+ * 启动批量安全同步，立即返回 `jobId`。
+ *
+ * 批量只执行 fastForward；`allowRestart` 为真才允许为「写入目标正是该档当前登录」
+ * 关闭并重开客户端，且整批只关闭/重开一次。进度用 {@link sessionBatchProgress} 轮询。
+ */
+export function startSessionBatchSync(args: {
+  client: SessionGroupClient;
+  groups: SessionBatchTarget[];
+  variantScope?: WbVariant;
+  allowRestart?: boolean;
+}): Promise<{ jobId: string }> {
+  return call("start_session_batch_sync", {
+    client: args.client,
+    groups: args.groups,
+    ...(args.variantScope ? { variantScope: args.variantScope } : {}),
+    ...(args.allowRestart ? { allowRestart: true } : {}),
+  });
+}
+
+/** 启动批量删除关联：只解除关联，不删除账号里的会话内容。 */
+export function startSessionBatchDelete(args: {
+  client: SessionGroupClient;
+  groups: SessionBatchTarget[];
+  variantScope?: WbVariant;
+}): Promise<{ jobId: string }> {
+  return call("start_session_batch_delete", {
+    client: args.client,
+    groups: args.groups,
+    ...(args.variantScope ? { variantScope: args.variantScope } : {}),
+  });
+}
+
+export function sessionBatchProgress(jobId: string): Promise<SessionBatchJob> {
+  return call("session_batch_progress", { jobId });
+}
+
+/** 请求取消：只在组与组之间生效（单组写入不可中断）。 */
+export function sessionBatchCancel(jobId: string): Promise<{ jobId: string; state: string; cancelRequested?: boolean; alreadyFinished?: boolean }> {
+  return call("session_batch_cancel", { jobId });
+}
+
+/** 最近的批量报告（含已结束的），用于提示「上次批量做到哪」。 */
+export function sessionBatchReports(limit = 5): Promise<SessionBatchJob[]> {
+  return call("session_batch_reports", { limit });
+}
+
+/**
+ * 最近一份「没跑完」的批量报告；没有则 `null`。
+ *
+ * 由后端挑「最近未完成」而不是取最新一份：最新那份常常是一次成功的小批量。
+ */
+export function sessionBatchLatestIncomplete(): Promise<SessionBatchJob | null> {
+  return call("session_batch_latest_incomplete");
+}
+
+/**
+ * 把文本写到用户选定的绝对路径（仅桌面端）。
+ *
+ * webui 没有任意写盘权限，那边走浏览器下载；因此这里没有对应的 HTTP 路由。
+ */
+export function saveTextFile(path: string, content: string): Promise<void> {
+  return call("save_text_file", { path, content });
 }

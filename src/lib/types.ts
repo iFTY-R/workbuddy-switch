@@ -1064,3 +1064,62 @@ export interface VscodeSessionList {
    */
   dataRoot?: string | null;
 }
+
+/** 批量操作的两种动作：安全同步（只做 fastForward）/ 删除关联（不动会话内容）。 */
+export type SessionBatchOp = "sync" | "delete";
+
+/**
+ * 批量单项状态。全部由后端写入，前端只展示：
+ * `pending` 未开始、`done` 已完成、`skipped` 计划阶段就判定无需/无法执行、
+ * `failed` 执行失败、`notRun` 因中止或取消而未执行。
+ */
+export type SessionBatchItemStatus = "pending" | "done" | "skipped" | "failed" | "notRun";
+
+/** 批量任务里的一个会话组结果。 */
+export interface SessionBatchItem {
+  /** 选择键（`client:scope:groupId`），用于把结果回填到列表选择态。 */
+  key: string;
+  groupId: string;
+  title: string;
+  status: SessionBatchItemStatus;
+  reasonCode?: string;
+  message?: string;
+  /** 本组实际完成的数量（同步成功的副本数 / 解除的关联数）；旧字段，保留兼容。 */
+  synced: number;
+  /** 与 `synced` 同值的通用名；旧报告没有该字段，读取时回退 `synced`。 */
+  affected?: number;
+  /** 计划阶段看到的目标数。 */
+  planned: number;
+}
+
+/** 一次批量任务的完整状态；任务由后端线程推进，前端轮询这个结构。 */
+export interface SessionBatchJob {
+  jobId: string;
+  client: SessionGroupClient;
+  op: SessionBatchOp;
+  /** `interrupted`：上一个进程在批量中途退出，报告停在最后一次落盘的状态。 */
+  state: "queued" | "planning" | "running" | "finished" | "interrupted";
+  total: number;
+  done: number;
+  /** 正在处理的 groupId；未运行时为 null。 */
+  current: string | null;
+  /** 中止原因（生命周期类失败）；正常结束为 null。 */
+  aborted: string | null;
+  cancelled: boolean;
+  startedAt: number;
+  finishedAt: number | null;
+  /** 本次关闭/重开的客户端；旧报告没有该字段。 */
+  lifecycle?: {
+    closed: string[];
+    /** 中止后刻意不重开（保留现场）。 */
+    keptClosed: boolean;
+    reopenErrors: string[];
+  };
+  items: SessionBatchItem[];
+}
+
+/** 批量操作的一个目标：key 用于回填选择态，groupId 用于执行。 */
+export interface SessionBatchTarget {
+  key: string;
+  groupId: string;
+}

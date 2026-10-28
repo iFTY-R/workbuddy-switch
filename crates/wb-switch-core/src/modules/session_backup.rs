@@ -43,6 +43,9 @@ pub const OPERATION_KIND_SYNC: &str = "sync";
 pub const SYNC_BACKUP_RETENTION_DAYS: i64 = 7;
 /// 同步备份同时保留的份数上限（按创建时间倒序，最老的先回收）。
 pub const MAX_RETAINED_SYNC_BACKUPS: usize = 50;
+/// 同步备份的总字节预算。每次备份都带一份 `workbuddy.db` 快照，按份数封顶在
+/// 大库（几百 MB）上会吃盘，所以再加一条按体积的兜底。
+pub const MAX_RETAINED_SYNC_BYTES: u64 = 1024 * 1024 * 1024;
 /// 业务日志里标记「本次备份已清理」。
 pub const CLEANUP_STATE_CLEANED: &str = "cleaned";
 /// 业务日志里标记「已验证安全终止」（未写业务，允许回收）。
@@ -905,12 +908,45 @@ fn prune_retained(paths: &SessionPaths, variant: WbVariant) {
         })
         .collect();
     kept.sort_by_key(|record| std::cmp::Reverse(record.created_at));
+    // 体积预算：从最旧的开始删，直到回到预算内。
+    let sizes: Vec<u64> = kept
+        .iter()
+        .map(|record| {
+            transaction_dir(paths, variant, &record.operation_id)
+                .map(|dir| retained_bytes(&dir))
+                .unwrap_or(0)
+        })
+        .collect();
+    let cutoff = kept
+        .len()
+        .saturating_sub(excess_count(&sizes, MAX_RETAINED_SYNC_BYTES));
     for (index, record) in kept.iter().enumerate() {
         let expired = record.retain_until.is_some_and(|until| until <= now);
-        if expired || index >= MAX_RETAINED_SYNC_BACKUPS {
+        if expired || index >= MAX_RETAINED_SYNC_BACKUPS || index >= cutoff {
             let _ = cleanup_operation(paths, variant, record);
         }
     }
+}
+
+/// 备份目录的体积估算：`workbuddy.db` 快照每次都写，是主要占用，正文备份相对小。
+fn retained_bytes(dir: &Path) -> u64 {
+    std::fs::metadata(dir.join("workbuddy.db"))
+        .map(|meta| meta.len())
+        .unwrap_or(0)
+}
+
+/// 给定「从新到旧」的体量列表与预算，返回需要从最旧端回收几份。
+fn excess_count(sizes_newest_first: &[u64], budget: u64) -> usize {
+    let mut total: u64 = sizes_newest_first.iter().sum();
+    let mut removed = 0;
+    for size in sizes_newest_first.iter().rev() {
+        if total <= budget {
+            break;
+        }
+        total = total.saturating_sub(*size);
+        removed += 1;
+    }
+    removed
 }
 
 /// 受控失败分支：尚未写业务（contract：protected 之前禁止业务写入）时回收自己的残留。
@@ -1555,5 +1591,14 @@ mod tests {
             other => panic!("重复调用失败：{other:?}"),
         };
         assert_eq!(first, second, "重复调用不得延长保留期");
+    }
+
+    #[test]
+    fn excess_count_drops_oldest_until_within_budget() {
+        assert_eq!(excess_count(&[10, 10, 10], 100), 0, "预算够就不删");
+        assert_eq!(excess_count(&[10, 10, 10], 30), 0, "刚好等于预算不删");
+        assert_eq!(excess_count(&[10, 10, 10], 25), 1, "从最旧的一端删一份");
+        assert_eq!(excess_count(&[10, 10, 10], 5), 3, "一份都不够就全删");
+        assert_eq!(excess_count(&[], 0), 0);
     }
 }

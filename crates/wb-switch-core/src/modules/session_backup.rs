@@ -1,7 +1,11 @@
 //! 会话临时备份的生命周期：成功清理、未完成保护（design §2–§6）。
 //!
-//! 备份只用于操作安全与中断恢复，不做长期留档：操作可靠完成后立即回收本次
-//! 专属临时目录；未完成（运行中/失败/中断/待恢复/状态不可验证）时保护材料。
+//! 备份主要用于操作安全与中断恢复；未完成（运行中/失败/中断/待恢复/状态不可验证）
+//! 时一律保护材料。成功后的处理按操作性质区分：
+//! - 复制不覆盖任何既有内容，完成后立即回收；
+//! - 同步要覆盖目标原有内容，成功后**保留 [`SYNC_BACKUP_RETENTION_DAYS`] 天**
+//!   （份数上限 [`MAX_RETAINED_SYNC_BACKUPS`]）。原因是摘要校验只能证明「写进去的
+//!   字节 = 计划的字节」，不能证明「内容本身正确」——语义级问题要留一条退路。
 //!
 //! 三条硬约束：
 //! - 删除授权来自「可靠落盘的业务完成状态」，不是 UI 成功文案，也不是缺日志；
@@ -12,6 +16,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::fs::File;
 // 只有非 Unix 的 `sync_file` 需要显式 OpenOptions（Unix 用只读句柄即可 fsync）。
+use std::collections::HashSet;
 #[cfg(not(unix))]
 use std::fs::OpenOptions;
 use std::io::{ErrorKind, Write};
@@ -32,6 +37,12 @@ pub const OPERATION_LIFECYCLE_VERSION: u32 = 1;
 pub const TRANSACTIONS_DIR_NAME: &str = "session-transactions";
 /// 维护记录目录：`session-links/backup-lifecycle/{variant}/{operationId}.json`。
 pub const LIFECYCLE_DIR_NAME: &str = "backup-lifecycle";
+/// 维护记录里表示「覆盖类操作」的类型值（`BackupLifecycle::kind`）。
+pub const OPERATION_KIND_SYNC: &str = "sync";
+/// 同步成功后旧内容的保留天数。
+pub const SYNC_BACKUP_RETENTION_DAYS: i64 = 7;
+/// 同步备份同时保留的份数上限（按创建时间倒序，最老的先回收）。
+pub const MAX_RETAINED_SYNC_BACKUPS: usize = 50;
 /// 业务日志里标记「本次备份已清理」。
 pub const CLEANUP_STATE_CLEANED: &str = "cleaned";
 /// 业务日志里标记「已验证安全终止」（未写业务，允许回收）。
@@ -82,6 +93,11 @@ pub struct BackupLifecycle {
     /// 目标会话标题（能取到时优先展示）。
     #[serde(default)]
     pub title: Option<String>,
+    /// 同步成功后的保留截止时间（毫秒）。`None` 表示不保留、按即时回收处理。
+    ///
+    /// `serde(default)`：旧维护记录没有该字段，读作 `None`，行为与改造前一致。
+    #[serde(default)]
+    pub retain_until: Option<i64>,
 }
 
 /// 维护记录扫描结果：读取/枚举/解析失败必须显式上报，不能当成「没有」。
@@ -100,6 +116,8 @@ pub enum CleanupOutcome {
     Pending { reason: String },
     /// 状态不可验证或归属异常：保留材料并上报，不做删除。
     Protected { reason: String },
+    /// 同步已成功，但按保留策略继续留档：`until_ms` 到期后由维护入口回收。
+    Retained { dir: PathBuf, until_ms: i64 },
 }
 
 impl CleanupOutcome {
@@ -482,6 +500,8 @@ pub fn begin_operation(
         last_error: None,
         session_id,
         title,
+        // 复制即时回收、同步成功后由 `retain_after_success` 写入截止时间。
+        retain_until: None,
     };
     save_lifecycle(paths, &record)?;
     let dir = transaction_dir(paths, variant, &operation_id)?;
@@ -644,6 +664,8 @@ fn mark_operation_cleaned(
 /// 单条维护记录的处理判定。
 enum Decision {
     Clean,
+    /// 保留期内不动：这份备份是「内容可能不对」时的唯一退路。
+    Keep,
     Protect(String),
 }
 
@@ -706,6 +728,26 @@ pub fn maintain(paths: &SessionPaths, variant: WbVariant) -> Vec<TemporaryFileIs
         && operation_scan.problems.is_empty()
         && lifecycle_scan.problems.is_empty();
 
+    // 维护也要执行份数上限：只在成功后触发一次 prune 的话，用户长期不操作时
+    // 保留目录会一直攒着。
+    let now = now_ms();
+    let mut retained_order: Vec<(i64, String)> = lifecycle_scan
+        .records
+        .iter()
+        .filter(|record| {
+            record.variant == variant
+                && record.state == BackupState::CleanupPending
+                && record.retain_until.is_some()
+        })
+        .map(|record| (record.created_at, record.operation_id.clone()))
+        .collect();
+    retained_order.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    let over_cap: HashSet<String> = retained_order
+        .into_iter()
+        .skip(MAX_RETAINED_SYNC_BACKUPS)
+        .map(|(_, operation_id)| operation_id)
+        .collect();
+
     for mut record in lifecycle_scan
         .records
         .into_iter()
@@ -715,7 +757,15 @@ pub fn maintain(paths: &SessionPaths, variant: WbVariant) -> Vec<TemporaryFileIs
             operation.operation_id == record.operation_id && operation.variant == variant
         });
         let decision = match record.state {
-            BackupState::CleanupPending => Decision::Clean,
+            // 保留期内不动；过了保留期或超出份数上限才回收。
+            BackupState::CleanupPending => {
+                let retained = record.retain_until.is_some_and(|until| until > now);
+                if retained && !over_cap.contains(&record.operation_id) {
+                    Decision::Keep
+                } else {
+                    Decision::Clean
+                }
+            }
             BackupState::Allocating => match operation {
                 // 本版契约：protected 之前禁止业务写入；扫描完整且无操作日志 ⇒ 尚未写业务。
                 None if deletions_allowed => Decision::Clean,
@@ -727,6 +777,7 @@ pub fn maintain(paths: &SessionPaths, variant: WbVariant) -> Vec<TemporaryFileIs
             BackupState::Protected => decide_by_operation(operation),
         };
         match decision {
+            Decision::Keep => {}
             Decision::Clean => {
                 if !deletions_allowed {
                     issues.push(TemporaryFileIssue::needs_recovery(
@@ -742,6 +793,8 @@ pub fn maintain(paths: &SessionPaths, variant: WbVariant) -> Vec<TemporaryFileIs
                 let _ = mark_cleanup_pending(paths, &mut record, None);
                 match cleanup_operation(paths, variant, &record) {
                     CleanupOutcome::Cleaned => {}
+                    // 保留只发生在「成功后」这条路径上，补清理分支不会拿到它。
+                    CleanupOutcome::Retained { .. } => {}
                     CleanupOutcome::Pending { reason } => {
                         issues.push(TemporaryFileIssue::cleanup_pending(
                             record.operation_id.clone(),
@@ -792,11 +845,72 @@ pub fn cleanup_after_success(
     variant: WbVariant,
     record: &BackupLifecycle,
 ) -> CleanupOutcome {
+    if record.kind == OPERATION_KIND_SYNC {
+        return retain_after_success(paths, variant, record);
+    }
     let outcome = cleanup_operation(paths, variant, record);
     if let CleanupOutcome::Pending { reason } = &outcome {
         let _ = record_cleanup_failure(paths, record, reason);
     }
     outcome
+}
+
+/// 同步成功后保留备份：写维护记录（幂等，重复调用不会延长保留期），再顺带回收过期项。
+fn retain_after_success(
+    paths: &SessionPaths,
+    variant: WbVariant,
+    record: &BackupLifecycle,
+) -> CleanupOutcome {
+    let dir = match transaction_dir(paths, variant, &record.operation_id) {
+        Ok(dir) => dir,
+        Err(reason) => return CleanupOutcome::Protected { reason },
+    };
+    // 已有截止时间就沿用：补清理/恢复路径可能重复调用，不能把窗口越推越远。
+    let until = record
+        .retain_until
+        .unwrap_or_else(|| now_ms() + SYNC_BACKUP_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+    let mut candidate = record.clone();
+    candidate.state = BackupState::CleanupPending;
+    candidate.retain_until = Some(until);
+    candidate.updated_at = now_ms();
+    candidate.last_error = None;
+    if let Err(error) = save_lifecycle(paths, &candidate) {
+        // 记录没写进去就不能对外声称「已保留」：按待清理上报，材料还在盘上。
+        return CleanupOutcome::Pending {
+            reason: format!("保留记录写入失败（{error}）"),
+        };
+    }
+    prune_retained(paths, variant);
+    CleanupOutcome::Retained {
+        dir,
+        until_ms: until,
+    }
+}
+
+/// 回收「已过期」或「超出份数上限」的同步备份（尽力而为，失败留给维护入口）。
+fn prune_retained(paths: &SessionPaths, variant: WbVariant) {
+    let scan = scan_lifecycle(paths);
+    if !scan.problems.is_empty() {
+        // 记录读不全就无法判断谁该留：这一轮什么都不删。
+        return;
+    }
+    let now = now_ms();
+    let mut kept: Vec<&BackupLifecycle> = scan
+        .records
+        .iter()
+        .filter(|record| {
+            record.variant == variant
+                && record.state == BackupState::CleanupPending
+                && record.retain_until.is_some()
+        })
+        .collect();
+    kept.sort_by_key(|record| std::cmp::Reverse(record.created_at));
+    for (index, record) in kept.iter().enumerate() {
+        let expired = record.retain_until.is_some_and(|until| until <= now);
+        if expired || index >= MAX_RETAINED_SYNC_BACKUPS {
+            let _ = cleanup_operation(paths, variant, record);
+        }
+    }
 }
 
 /// 受控失败分支：尚未写业务（contract：protected 之前禁止业务写入）时回收自己的残留。
@@ -1166,6 +1280,7 @@ mod tests {
             last_error: None,
             session_id: None,
             title: None,
+            retain_until: None,
         };
         match cleanup_operation(&paths, WbVariant::Cn, &record) {
             CleanupOutcome::Protected { reason } => assert!(reason.contains("UUID")),
@@ -1364,5 +1479,81 @@ mod tests {
                 .exists(),
             "链接目标内的文件不得被删除"
         );
+    }
+
+    // ── 同步备份保留策略 ────────────────────────────────────────────────
+
+    fn retained_backup(paths: &SessionPaths, kind: &str) -> (BackupLifecycle, PathBuf) {
+        let mut record = begin_operation(paths, WbVariant::Cn, kind, None, None).unwrap();
+        let target = transaction_dir(paths, WbVariant::Cn, &record.operation_id).unwrap();
+        std::fs::write(target.join("bodies.jsonl"), b"old").unwrap();
+        mark_protected(paths, &mut record).unwrap();
+        (record, target)
+    }
+
+    #[test]
+    fn sync_success_keeps_backup_inside_retention_window() {
+        let dir = TempDir::new("retain-sync");
+        let paths = dir.paths();
+        let (record, target) = retained_backup(&paths, OPERATION_KIND_SYNC);
+
+        let (kept, until) = match cleanup_after_success(&paths, WbVariant::Cn, &record) {
+            CleanupOutcome::Retained { dir, until_ms } => (dir, until_ms),
+            other => panic!("同步成功后必须保留备份，实际：{other:?}"),
+        };
+        assert!(kept.is_dir(), "保留期内不得删除旧内容备份");
+        assert!(until > now_ms(), "截止时间必须晚于当前时间");
+
+        // 保留期内维护入口也不得回收：这份备份是唯一退路。
+        let issues = maintain(&paths, WbVariant::Cn);
+        assert!(issues.is_empty(), "{issues:?}");
+        assert!(target.is_dir(), "维护不得越过保留期");
+    }
+
+    #[test]
+    fn copy_success_still_reclaims_immediately() {
+        let dir = TempDir::new("copy-clean");
+        let paths = dir.paths();
+        let (record, target) = retained_backup(&paths, "copy");
+
+        let outcome = cleanup_after_success(&paths, WbVariant::Cn, &record);
+        assert!(outcome.is_cleaned(), "{outcome:?}");
+        assert!(!target.exists(), "复制不覆盖既有内容，不需要留档");
+    }
+
+    #[test]
+    fn expired_sync_backup_is_reclaimed_by_maintenance() {
+        let dir = TempDir::new("retain-expired");
+        let paths = dir.paths();
+        let (record, target) = retained_backup(&paths, OPERATION_KIND_SYNC);
+        let _ = cleanup_after_success(&paths, WbVariant::Cn, &record);
+
+        // 把截止时间推到过去，模拟保留期已过。
+        let mut stored = scan_lifecycle(&paths).records.into_iter().next().unwrap();
+        stored.retain_until = Some(now_ms() - 1);
+        save_lifecycle(&paths, &stored).unwrap();
+
+        let issues = maintain(&paths, WbVariant::Cn);
+        assert!(issues.is_empty(), "{issues:?}");
+        assert!(!target.exists(), "过期的同步备份应被维护回收");
+    }
+
+    #[test]
+    fn repeated_success_does_not_extend_retention() {
+        let dir = TempDir::new("retain-idempotent");
+        let paths = dir.paths();
+        let (record, _target) = retained_backup(&paths, OPERATION_KIND_SYNC);
+
+        let first = match cleanup_after_success(&paths, WbVariant::Cn, &record) {
+            CleanupOutcome::Retained { until_ms, .. } => until_ms,
+            other => panic!("首次保留失败：{other:?}"),
+        };
+        // 恢复/补清理路径会重复调用：沿用已有截止时间，不能越推越远。
+        let stored = scan_lifecycle(&paths).records.into_iter().next().unwrap();
+        let second = match cleanup_after_success(&paths, WbVariant::Cn, &stored) {
+            CleanupOutcome::Retained { until_ms, .. } => until_ms,
+            other => panic!("重复调用失败：{other:?}"),
+        };
+        assert_eq!(first, second, "重复调用不得延长保留期");
     }
 }

@@ -2407,6 +2407,7 @@ mod tests {
                 last_error: Some("临时目录删除失败：权限不足".to_string()),
                 session_id: None,
                 title: None,
+                retain_until: None,
             },
         )
         .unwrap();

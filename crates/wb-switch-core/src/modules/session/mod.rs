@@ -1468,7 +1468,7 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
     );
     // 业务可靠完成之后才授权清理；清理失败不回滚业务、不报告复制失败。
     let cleanup = finish_backup_cleanup(paths, context.variant, &mut lifecycle);
-    let (backup, cleanup_state, cleanup_error) = report_cleanup(&cleanup, &backup_dir);
+    let (backup, cleanup_state, cleanup_error, _) = report_cleanup(&cleanup, &backup_dir);
     Ok(CopyOutcome::Copied {
         new_id: new_cid,
         group_id,
@@ -1521,21 +1521,32 @@ fn reconcile_reported_cleanup(items: &mut [Value]) {
 }
 
 /// 清理结果到报告字段的投影：已清理不展示路径；待清理保留位置与原因。
+/// 清理结果 → 报告字段：`(备份位置, 状态, 失败原因, 保留截止时间)`。
+///
+/// `retained` 只出现在同步成功后：旧内容按保留策略留档，窗口内可从该目录手工恢复。
 fn report_cleanup(
     cleanup: &CleanupOutcome,
     dir: &Path,
-) -> (Option<String>, &'static str, Option<String>) {
+) -> (Option<String>, &'static str, Option<String>, Option<i64>) {
     match cleanup {
-        CleanupOutcome::Cleaned => (None, "cleaned", None),
+        CleanupOutcome::Cleaned => (None, "cleaned", None, None),
         CleanupOutcome::Pending { reason } => (
             Some(dir.to_string_lossy().to_string()),
             "pending",
             Some(reason.clone()),
+            None,
         ),
         CleanupOutcome::Protected { reason } => (
             Some(dir.to_string_lossy().to_string()),
             "pending",
             Some(reason.clone()),
+            None,
+        ),
+        CleanupOutcome::Retained { dir, until_ms } => (
+            Some(dir.to_string_lossy().to_string()),
+            "retained",
+            None,
+            Some(*until_ms),
         ),
     }
 }
@@ -4089,7 +4100,8 @@ fn execute_sync_item(
     );
     // 业务可靠完成后才授权清理；清理失败不回滚业务、不报告同步失败。
     let cleanup = finish_backup_cleanup(paths, context.variant, &mut lifecycle);
-    let (backup_path, cleanup_state, cleanup_error) = report_cleanup(&cleanup, &backup.dir);
+    let (backup_path, cleanup_state, cleanup_error, retain_until) =
+        report_cleanup(&cleanup, &backup.dir);
     let manifest_path = backup_path
         .as_ref()
         .map(|path| format!("{path}/manifest.json"));
@@ -4113,6 +4125,10 @@ fn execute_sync_item(
     });
     if let Some(error) = cleanup_error {
         item["cleanupError"] = json!(error);
+    }
+    // 覆盖类操作的成功结果会保留旧内容：把截止时间给出去，用户才知道什么时候之前还能恢复。
+    if let Some(until) = retain_until {
+        item["retainUntil"] = json!(until);
     }
     // 顺手修好的行字段（清掉抄来的项目归属 / 前移最近活动时间）：目标账号里
     // 「同步成功但看不到」时先看这里。

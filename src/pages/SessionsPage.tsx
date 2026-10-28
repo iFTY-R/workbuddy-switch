@@ -1201,10 +1201,16 @@ function notifyResult(report: { synced?: unknown[]; skipped?: unknown[]; errors?
     const fields = item as { repaired?: string[] } | null;
     return (fields?.repaired?.length ?? 0) > 0;
   }).length;
+  // 同步会覆盖目标原有内容：成功后旧内容按保留策略留档，提示里说明「还能恢复」，
+  // 否则用户会以为旧的已经彻底没了。
+  const retained = (report.synced ?? []).filter((item) => {
+    const fields = item as { cleanupState?: string } | null;
+    return fields?.cleanupState === "retained";
+  }).length;
   const restartHint = report.restartedVariants?.length
     ? `，已重新打开 ${report.restartedVariants.map(variantLabel).join("、")}`
     : report.restartedEditor ? "，已重新打开 VS Code" : "";
-  if (synced > 0) toast.success(targetName ? `已同步到「${targetName}」` : `已同步 ${synced} 个会话`, { description: `完成 ${synced} 项${restartHint}${repaired > 0 ? `；其中 ${repaired} 项已修复项目归属，会话列表刷新后可见` : ""}` });
+  if (synced > 0) toast.success(targetName ? `已同步到「${targetName}」` : `已同步 ${synced} 个会话`, { description: `完成 ${synced} 项${restartHint}${repaired > 0 ? `；其中 ${repaired} 项已修复项目归属，会话列表刷新后可见` : ""}${retained > 0 ? "；覆盖前的旧内容已备份，保留期内可恢复" : ""}` });
   if (skipped > 0) toast.warning(`有 ${skipped} 项跳过`, { description: "预览过期或复核后不再符合安全条件的项不会计为成功。" });
   if (errors.length > 0) toast.error("部分会话同步失败", { description: errors.map((item) => item.error).join("；") });
   if (report.needsRecovery) toast.error("会话操作待恢复", { description: report.temporaryFiles?.map((item) => item.reason).join("；") || "已保留恢复所需材料。" });

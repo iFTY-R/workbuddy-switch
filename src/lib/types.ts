@@ -113,7 +113,14 @@ export interface Session {
 }
 
 /** 临时备份的清理状态：cleaned 已回收；pending 已保留待下次维护重试；legacyRetained 旧操作无生命周期记录。 */
-export type SessionBackupCleanupState = "cleaned" | "pending" | "legacyRetained";
+/**
+ * 临时备份的最终去向：
+ * - `cleaned` 已回收；
+ * - `pending` 本轮没清掉，下次维护重试；
+ * - `retained` 同步成功后按保留策略留档（窗口内可从 `backup` 目录手工恢复）；
+ * - `legacyRetained` 旧版本遗留、未纳入维护。
+ */
+export type SessionBackupCleanupState = "cleaned" | "pending" | "retained" | "legacyRetained";
 
 /**
  * 临时备份残留（待清理 / 待恢复）：复制、同步、恢复报告共用同一结构。
@@ -135,7 +142,7 @@ export interface CopyResult {
   groupId: string;
   /** 待清理位置（已清理为 null）；仅表示待清理，不是可撤销备份。 */
   backup: string | null;
-  /** 成功后立即清理：cleaned 已回收 / pending 待下次维护重试；旧后端可能缺字段。 */
+  /** 复制不覆盖既有内容，成功即回收：cleaned 已回收 / pending 待下次维护重试。 */
   cleanupState?: SessionBackupCleanupState;
   /** 清理失败原因（`cleanupState` 为 pending 时有值）。 */
   cleanupError?: string;
@@ -268,9 +275,14 @@ export interface SessionSyncResultItem {
   /** 待清理位置（已清理为 null）；旧操作可能仍返回目录路径。 */
   backup: string | null;
   backupManifest: string | null;
-  /** 成功后立即清理：cleaned 表示临时备份已回收；pending 表示待下次维护重试。 */
+  /**
+   * 备份去向：`retained` 表示覆盖前的旧内容仍在（`retainUntil` 之前可恢复），
+   * `cleaned` 表示已按策略回收，`pending` 表示本轮回收失败。
+   */
   cleanupState?: SessionBackupCleanupState;
   cleanupError?: string;
+  /** 同步成功后旧内容的保留截止时间（毫秒）；`cleanupState` 为 retained 时有值。 */
+  retainUntil?: number;
   /**
    * 本次顺手修复的行字段。目前只有 `project_id`：旧版本复制会把源账号的项目归属
    * 抄到目标副本上，客户端据此把会话判成 project 空间，同步成功也「看不到」。

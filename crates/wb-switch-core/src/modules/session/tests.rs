@@ -4185,34 +4185,33 @@ fn sync_fast_forward_replaces_body_and_advances_pair_baseline() {
     assert_eq!(synced[0]["recordCount"]["targetBefore"], 2);
     assert_eq!(synced[0]["recordCount"]["target"], 5);
 
-    // 成功清理：不展示可还原路径，本次临时目录与维护记录都已回收。
-    assert!(synced[0]["backup"].is_null(), "{report}");
-    assert!(synced[0]["backupManifest"].is_null(), "{report}");
-    assert_eq!(synced[0]["cleanupState"], "cleaned", "{report}");
+    // 覆盖类操作成功后保留旧内容备份（保留期内可恢复）：摘要校验只能证明「写进去的
+    // 字节 = 计划的字节」，不能证明内容本身正确，所以必须留一条退路。
+    assert!(!synced[0]["backup"].is_null(), "{report}");
+    assert_eq!(synced[0]["cleanupState"], "retained", "{report}");
+    assert!(
+        synced[0]["retainUntil"].as_i64().unwrap_or_default() > 0,
+        "必须给出保留截止时间：{report}"
+    );
     assert_ne!(body_bytes(&env, &target_id), target_body_before);
     let operations = sync_operations(&env);
     assert_eq!(operations.len(), 1);
     let operation_id = operations[0].operation_id.clone();
     assert!(
-        !session_backup::transaction_dir(&env.paths, WbVariant::Cn, &operation_id)
+        session_backup::transaction_dir(&env.paths, WbVariant::Cn, &operation_id)
             .unwrap()
-            .exists(),
-        "成功路径必须回收本次操作专属目录"
-    );
-    assert!(
-        session_backup::scan_lifecycle(&env.paths)
-            .records
-            .is_empty(),
-        "成功路径不得残留维护记录"
+            .is_dir(),
+        "保留期内不得回收本次操作专属目录"
     );
     assert_eq!(
+        session_backup::scan_lifecycle(&env.paths).records.len(),
+        1,
+        "保留期需要维护记录作为到期回收的依据"
+    );
+    assert_ne!(
         operations[0].cleanup_state.as_deref(),
         Some(session_backup::CLEANUP_STATE_CLEANED),
-        "业务日志标注备份已清理"
-    );
-    assert!(
-        operations[0].backup.is_none(),
-        "已清理的操作不再展示备份位置"
+        "目录还在盘上，业务日志不能标成已清理"
     );
 
     // 目标正文被替换为来源内容（本副本 sessionId 换成目标 id）；来源正文不动。

@@ -185,6 +185,9 @@ pub fn run() {
 
     let app = builder
         .setup(|app| {
+            // 上一个进程若在批量中途被强杀，报告会停在 running：启动时标成 interrupted，
+            // 用户下次打开才能看到「上次批量没跑完」。幂等，失败不影响启动。
+            modules::session_batch::mark_interrupted_batches();
             #[cfg(desktop)]
             {
                 // 插件已在 initialize_plugins 阶段决定 notify-or-exit；此处只兜底
@@ -254,6 +257,13 @@ pub fn run() {
             commands::sync_session_group_pair,
             commands::sync_session_group_unify,
             commands::sync_session_group_safe_batch,
+            commands::start_session_batch_sync,
+            commands::start_session_batch_delete,
+            commands::session_batch_progress,
+            commands::session_batch_cancel,
+            commands::session_batch_reports,
+            commands::session_batch_latest_incomplete,
+            commands::save_text_file,
             commands::add_session_group_member,
             commands::copy_linked_sessions,
             commands::vscode_restart_precheck,

@@ -11,8 +11,8 @@ use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
     codebuddy_ide_session, codebuddy_ide_session_sync, credit_usage, credits, error_log,
     export_import, jetbrains, limits, notifications, oauth, process, rate_limit_events,
-    rate_limit_hook, refresh, rotate, session, session_groups, switch, token_stats, travel, update,
-    variant::WbVariant, vscode_ext, vscode_session, vscode_session_sync,
+    rate_limit_hook, refresh, rotate, session, session_batch, session_groups, switch, token_stats,
+    travel, update, variant::WbVariant, vscode_ext, vscode_session, vscode_session_sync,
 };
 
 #[derive(Serialize)]
@@ -1465,4 +1465,97 @@ pub async fn list_notifications() -> Result<Value, String> {
 #[tauri::command]
 pub async fn clear_notifications() -> Result<(), String> {
     notifications::clear()
+}
+
+/// 批量操作的一个目标：`key` 用于前端回填选择态，`groupId` 用于执行。
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchGroupKey {
+    pub key: String,
+    pub group_id: String,
+}
+
+/// 启动批量安全同步。立即返回 jobId，进度由 `session_batch_progress` 轮询。
+///
+/// 批量只执行 fastForward；`allow_restart` 为真才允许为「写入目标正是该档当前登录」
+/// 关闭并重开客户端，且整批只进出一次。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn start_session_batch_sync(
+    client: String,
+    variant_scope: Option<String>,
+    groups: Vec<BatchGroupKey>,
+    allow_restart: Option<bool>,
+) -> Result<Value, String> {
+    let client = session_groups::SessionClient::parse(&client)?;
+    let scope = session_groups::parse_variant_scope(variant_scope.as_deref())?;
+    let keys = groups
+        .into_iter()
+        .map(|group| (group.key, group.group_id))
+        .collect::<Vec<_>>();
+    // 返回 `{ jobId }` 而不是裸字符串：webui 的 HTTP 通道返回的也是这个形状，
+    // 两条通道必须同形，否则桌面端拿到的 `jobId` 会是 undefined。
+    session_batch::start_sync(client, scope, &keys, allow_restart.unwrap_or(false))
+        .map(|job_id| json!({ "jobId": job_id }))
+}
+
+/// 启动批量删除关联：只解除关联，不删除账号里的会话内容。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn start_session_batch_delete(
+    client: String,
+    variant_scope: Option<String>,
+    groups: Vec<BatchGroupKey>,
+) -> Result<Value, String> {
+    let client = session_groups::SessionClient::parse(&client)?;
+    let scope = session_groups::parse_variant_scope(variant_scope.as_deref())?;
+    let keys = groups
+        .into_iter()
+        .map(|group| (group.key, group.group_id))
+        .collect::<Vec<_>>();
+    session_batch::start_delete(client, scope, &keys).map(|job_id| json!({ "jobId": job_id }))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn session_batch_progress(job_id: String) -> Result<Value, String> {
+    session_batch::progress(&job_id)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn session_batch_cancel(job_id: String) -> Result<Value, String> {
+    session_batch::cancel(&job_id)
+}
+
+/// 最近一份「没跑完」的批量报告（中断 / 有失败或未执行项）；没有则 null。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn session_batch_latest_incomplete() -> Value {
+    session_batch::latest_incomplete_report()
+}
+
+/// 最近若干次批量报告（含已结束的），供界面提示「上次批量做到哪」。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn session_batch_reports(limit: Option<usize>) -> Value {
+    session_batch::recent_reports(limit.unwrap_or(5))
+}
+
+/// 把文本写到用户选定的绝对路径（导出批量报告用，仅桌面端）。
+///
+/// webui 没有任意写盘权限，那边走浏览器下载；这里只校验「绝对路径」，
+/// 目标目录是否存在、是否可写由 `atomic_write` 报错。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn save_text_file(path: String, content: String) -> Result<(), String> {
+    let path = std::path::PathBuf::from(path.trim());
+    if path.as_os_str().is_empty() || !path.is_absolute() {
+        return Err("导出路径必须是绝对路径".to_string());
+    }
+    // 只允许导出类文件：这个命令能被 webview 内任何脚本调用，
+    // 「任意绝对路径」等于把写文件能力借给任何未来的 XSS。
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(extension.as_str(), "csv" | "json" | "txt") {
+        return Err("导出文件只支持 .csv / .json / .txt".to_string());
+    }
+    wb_switch_core::modules::config::atomic_write(&path, &content)
+        .map_err(|error| format!("写入导出文件失败：{error}"))
 }

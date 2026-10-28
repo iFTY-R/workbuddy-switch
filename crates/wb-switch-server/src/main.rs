@@ -12,7 +12,8 @@ mod api;
 use serde_json::json;
 
 use wb_switch_core::modules::{
-    account, auth_file, checkin, config, process, rotate, travel, update, variant::WbVariant,
+    account, auth_file, checkin, config, process, rotate, session_batch, travel, update,
+    variant::WbVariant,
 };
 
 fn default_port() -> u16 {
@@ -147,6 +148,8 @@ async fn serve(args: &[String]) {
         }
     }
 
+    // 上个进程在批量中途退出时，报告会停在 running：起服务前标记成 interrupted。
+    session_batch::mark_interrupted_batches();
     let app = api::router();
     let addr = format!("127.0.0.1:{port}");
     let listener = match tokio::net::TcpListener::bind(&addr).await {

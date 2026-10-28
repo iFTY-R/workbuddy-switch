@@ -24,8 +24,8 @@ use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
     codebuddy_ide_session, codebuddy_ide_session_sync, config, credit_usage, credits,
     export_import, jetbrains, limits, notifications, oauth, process, rate_limit_events,
-    rate_limit_hook, refresh, rotate, session, session_groups, switch, token_stats, travel, update,
-    variant::WbVariant, vscode_ext, vscode_session, vscode_session_sync,
+    rate_limit_hook, refresh, rotate, session, session_batch, session_groups, switch, token_stats,
+    travel, update, variant::WbVariant, vscode_ext, vscode_session, vscode_session_sync,
 };
 
 /// WorkBuddy 运行状态缓存：Windows 上检测要跑 tasklist（慢），缓存几秒避免
@@ -254,6 +254,30 @@ pub fn router() -> Router {
             post(api_unlink_session_group_member),
         )
         .route("/api/session-groups/delete", post(api_delete_session_group))
+        .route(
+            "/api/session-groups/batch-sync",
+            post(api_start_session_batch_sync),
+        )
+        .route(
+            "/api/session-groups/batch-delete",
+            post(api_start_session_batch_delete),
+        )
+        .route(
+            "/api/session-groups/batch-progress",
+            post(api_session_batch_progress),
+        )
+        .route(
+            "/api/session-groups/batch-cancel",
+            post(api_session_batch_cancel),
+        )
+        .route(
+            "/api/session-groups/batch-reports",
+            post(api_session_batch_reports),
+        )
+        .route(
+            "/api/session-groups/batch-latest-incomplete",
+            post(api_session_batch_latest_incomplete),
+        )
         .route(
             "/api/session-groups/copy-linked",
             post(api_copy_linked_sessions),
@@ -1321,6 +1345,76 @@ async fn api_sync_session_group_safe_batch(Json(body): Json<Value>) -> Response 
         Ok(value) => json_ok(value),
         Err(error) => json_err(error, StatusCode::BAD_REQUEST),
     }
+}
+
+/// 批量目标：前端传 `(key, groupId)`，key 用于回填选择态。
+fn session_batch_groups(body: &Value) -> Vec<(String, String)> {
+    body.get("groups")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|group| {
+            let group_id = group.get("groupId").and_then(Value::as_str)?;
+            let key = group.get("key").and_then(Value::as_str).unwrap_or("");
+            Some((key.to_string(), group_id.to_string()))
+        })
+        .collect()
+}
+
+async fn api_start_session_batch_sync(Json(body): Json<Value>) -> Response {
+    let (client, scope) = match session_group_request(&body) {
+        Ok(value) => value,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let allow_restart = body
+        .get("allowRestart")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    match session_batch::start_sync(client, scope, &session_batch_groups(&body), allow_restart) {
+        Ok(job_id) => json_ok(json!({ "jobId": job_id })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_start_session_batch_delete(Json(body): Json<Value>) -> Response {
+    let (client, scope) = match session_group_request(&body) {
+        Ok(value) => value,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    match session_batch::start_delete(client, scope, &session_batch_groups(&body)) {
+        Ok(job_id) => json_ok(json!({ "jobId": job_id })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+async fn api_session_batch_progress(Json(body): Json<Value>) -> Response {
+    let job_id = body.get("jobId").and_then(Value::as_str).unwrap_or("");
+    match session_batch::progress(job_id) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::NOT_FOUND),
+    }
+}
+
+async fn api_session_batch_cancel(Json(body): Json<Value>) -> Response {
+    let job_id = body.get("jobId").and_then(Value::as_str).unwrap_or("");
+    match session_batch::cancel(job_id) {
+        Ok(value) => json_ok(value),
+        Err(error) => json_err(error, StatusCode::NOT_FOUND),
+    }
+}
+
+async fn api_session_batch_latest_incomplete() -> Response {
+    json_ok(session_batch::latest_incomplete_report())
+}
+
+async fn api_session_batch_reports(Json(body): Json<Value>) -> Response {
+    let limit = body
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(5)
+        .min(20) as usize;
+    json_ok(session_batch::recent_reports(limit))
 }
 
 async fn api_add_session_group_member(Json(body): Json<Value>) -> Response {

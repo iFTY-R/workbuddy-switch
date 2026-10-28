@@ -47,7 +47,7 @@ impl SessionClient {
         }
     }
 
-    fn store_paths(self) -> SessionPaths {
+    pub(crate) fn store_paths(self) -> SessionPaths {
         match self {
             Self::Workbuddy => SessionPaths::for_variant(WbVariant::Cn),
             Self::CodebuddyIde => SessionPaths::for_codebuddy_ide(),
@@ -421,7 +421,7 @@ fn sync_unify_batch_vscode(
     settle_editor_window(guard, Ok(combined))
 }
 
-fn running_target_needs_restart(variant: WbVariant, target_uid: &str) -> bool {
+pub(crate) fn running_target_needs_restart(variant: WbVariant, target_uid: &str) -> bool {
     should_restart_running_target(
         process::is_workbuddy_running(variant),
         session::current_user_uid(variant).as_deref(),
@@ -437,14 +437,14 @@ fn should_restart_running_target(
     running && current_uid.is_none_or(|uid| uid == target_uid)
 }
 
-fn workbuddy_variant_label(variant: WbVariant) -> &'static str {
+pub(crate) fn workbuddy_variant_label(variant: WbVariant) -> &'static str {
     match variant {
         WbVariant::Cn => "WorkBuddy 国内版",
         WbVariant::Ai => "WorkBuddy 国际版",
     }
 }
 
-fn reopen_workbuddy_variants(variants: &[WbVariant]) -> Vec<String> {
+pub(crate) fn reopen_workbuddy_variants(variants: &[WbVariant]) -> Vec<String> {
     variants
         .iter()
         .filter_map(|variant| {

@@ -1453,6 +1453,10 @@ fn overwrite(paths: &SessionPaths, plan: &SyncItemPlan) -> Result<Value, String>
         return Err("来源内容与索引不一致，已停止同步".to_string());
     }
 
+    // 0) 上次覆盖若在「退役 → 就位」之间被打断，目标目录会缺、旧内容留在 `.old-` 下：
+    //    先还原再继续，否则这次备份会建在残缺状态上。
+    recover_retired_target(&plan.target_dir);
+
     // 1) 整目录备份（先备份再动任何东西）。
     let backup_dir = backup_root(paths, plan.backup_kind)
         .join(&plan.workspace_hash)
@@ -1505,14 +1509,33 @@ fn overwrite(paths: &SessionPaths, plan: &SyncItemPlan) -> Result<Value, String>
         vscode_session::remove_dir_all_if_exists(&tmp_dir);
         return Err(format!("重建副本会话目录失败：{error}"));
     }
-    vscode_session::remove_dir_all_if_exists(&plan.target_dir);
+    // 让旧目录「退役」再让新目录就位：两次都是同卷 rename。即便进程在两次之间被杀，
+    // 旧内容仍完整躺在 `.old-<id>` 下（可自动复原），而不是被 remove_dir_all 直接删掉。
+    let retired_dir = plan.target_dir.with_file_name(format!(
+        ".old-{}{OVERWRITE_SUFFIX}",
+        plan.target_conversation_id
+    ));
+    vscode_session::remove_dir_all_if_exists(&retired_dir);
+    let retired = plan.target_dir.exists();
+    if retired {
+        if let Err(error) = std::fs::rename(&plan.target_dir, &retired_dir) {
+            vscode_session::remove_dir_all_if_exists(&tmp_dir);
+            return Err(format!("移交原有副本会话目录失败：{error}"));
+        }
+    }
     if let Err(error) = std::fs::rename(&tmp_dir, &plan.target_dir) {
         vscode_session::remove_dir_all_if_exists(&tmp_dir);
+        if retired {
+            // 就位失败：把退役目录改回原名，目标路径至少还是原来那份内容。
+            let _ = std::fs::rename(&retired_dir, &plan.target_dir);
+        }
         return Err(rollback_message(
             restore_dir(&backup_dir, &plan.target_dir),
             &format!("提交副本会话目录失败：{error}"),
         ));
     }
+    // 就位成功后才清理退役目录；这一步失败无妨，下次覆盖前会再清一次。
+    vscode_session::remove_dir_all_if_exists(&retired_dir);
 
     // 4) 复算核验：重建后的记录摘要必须与来源一致，否则整目录回滚。
     let rebuilt =
@@ -1552,6 +1575,26 @@ fn overwrite(paths: &SessionPaths, plan: &SyncItemPlan) -> Result<Value, String>
         "backup": backup_dir.to_string_lossy(),
         "message": format!("已用当前账号的 {source_count} 条内容覆盖副本（覆盖前已整目录备份）"),
     }))
+}
+
+/// 还原被中断的覆盖：目标目录缺失、而同级存在 `.old-<目标目录名>` 时改回原名。
+///
+/// 只在「目标不存在」时动手——目标还在就说明上次已完成就位，`.old-` 只是待清理残留，
+/// 不能拿旧内容覆盖新内容。
+fn recover_retired_target(target_dir: &Path) {
+    if target_dir.exists() {
+        return;
+    }
+    let (Some(name), Some(parent)) = (
+        target_dir.file_name().and_then(|name| name.to_str()),
+        target_dir.parent(),
+    ) else {
+        return;
+    };
+    let retired = parent.join(format!(".old-{name}"));
+    if retired.is_dir() {
+        let _ = std::fs::rename(&retired, target_dir);
+    }
 }
 
 /// 从备份目录整目录恢复目标会话目录。
@@ -2951,5 +2994,51 @@ mod tests {
             composed.contains(&backup_dir.to_string_lossy().to_string()),
             "{composed}"
         );
+    }
+
+    // ── 覆盖的目录交接 ──────────────────────────────────────────────────
+
+    #[test]
+    fn recover_retired_target_restores_when_target_is_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "wb-overwrite-recover-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let target = dir.join(format!("{CONV_SRC}{OVERWRITE_SUFFIX}"));
+        let retired = dir.join(format!(".old-{CONV_SRC}{OVERWRITE_SUFFIX}"));
+        std::fs::create_dir_all(&retired).unwrap();
+        std::fs::write(retired.join("index.json"), b"{}").unwrap();
+
+        // 目标缺失 + 退役目录在：还原，不能把旧内容留在隐藏名字下。
+        recover_retired_target(&target);
+        assert!(
+            target.join("index.json").is_file(),
+            "旧内容必须回到目标路径"
+        );
+        assert!(!retired.exists(), "还原后不应残留退役目录");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recover_retired_target_never_clobbers_a_live_target() {
+        let dir = std::env::temp_dir().join(format!(
+            "wb-overwrite-keep-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let target = dir.join(format!("{CONV_SRC}{OVERWRITE_SUFFIX}"));
+        let retired = dir.join(format!(".old-{CONV_SRC}{OVERWRITE_SUFFIX}"));
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("index.json"), b"new").unwrap();
+        std::fs::create_dir_all(&retired).unwrap();
+        std::fs::write(retired.join("index.json"), b"old").unwrap();
+
+        recover_retired_target(&target);
+        assert_eq!(
+            std::fs::read_to_string(target.join("index.json")).unwrap(),
+            "new",
+            "目标还在时说明上次已就位，不能用旧内容覆盖"
+        );
+        assert!(retired.exists(), "退役目录留给覆盖流程自己清理");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

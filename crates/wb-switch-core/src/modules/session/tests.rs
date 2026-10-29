@@ -6374,7 +6374,9 @@ fn copy_carries_session_usage_row() {
         .expect("副本必须有用量行，否则「上下文用量」显示为 0");
     assert_eq!(row.0, 425769);
     assert_eq!(row.1, 1000000);
-    assert_eq!(row.2.as_deref(), Some("{\"r1\":1.5}"));
+    // `credit_json` 是「这笔会话花了多少钱」（客户端按 requestId 累加）。副本在目标
+    // 账号下还没产生过消费，照搬会让它显示源账号付过的钱，所以必须留空。
+    assert_eq!(row.2, None, "费用记录不该跟着副本走");
 }
 
 #[test]

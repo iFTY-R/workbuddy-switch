@@ -738,11 +738,17 @@ fn insert_session_copy(
     Ok(DbCopyOutcome::Inserted(normalized))
 }
 
-/// 复制 `session_usage` 行（`used`/`size`/`credit_json`）。
+/// 复制 `session_usage` 行：`used`/`size` 照搬，`credit_json` 置 NULL。
 ///
 /// 与 `sessions` 不同，这里可以用 `INSERT OR REPLACE`：主键是本次新分配的会话 id，
 /// 撞库只可能发生在恢复重放，语义正是「把上次写的同一行再写一次」。
 /// 旧客户端的库里可能没有这张表；此时跳过，不当成复制失败。
+///
+/// `credit_json` 的语义是「**这笔会话花了多少钱**」，客户端按
+/// `persistUsage(conversationId, requestId, usage)` 逐次累加（键是 requestId，
+/// 不是账号）。照搬会让目标账号的副本显示源账号付过的钱——那笔费用既不在目标
+/// 账号的账上，也不该出现在它的会话详情里。副本在目标账号下还没产生过消费，
+/// 所以留空才是事实。
 fn copy_session_usage_row(
     source: &rusqlite::Connection,
     target: &rusqlite::Connection,
@@ -755,26 +761,20 @@ fn copy_session_usage_row(
     }
     let row = source
         .query_row(
-            "SELECT used, size, credit_json FROM session_usage WHERE session_id = ?1",
+            "SELECT used, size FROM session_usage WHERE session_id = ?1",
             [source_cid],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            },
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
         )
         .optional()
         .map_err(|error| format!("会话用量读取失败：{error}"))?;
-    let Some((used, size, credit)) = row else {
+    let Some((used, size)) = row else {
         return Ok(false);
     };
     target
         .execute(
             "INSERT OR REPLACE INTO session_usage (session_id, used, size, updated_at, credit_json)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![new_cid, used, size, now, credit],
+             VALUES (?1, ?2, ?3, ?4, NULL)",
+            rusqlite::params![new_cid, used, size, now],
         )
         .map_err(|error| format!("会话用量保存失败：{error}"))?;
     Ok(true)

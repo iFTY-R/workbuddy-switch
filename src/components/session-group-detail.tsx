@@ -1,6 +1,7 @@
 import { useLayoutEffect, useRef, useState } from "react";
 import { ArrowRight, Check, ChevronDown, ChevronLeft, Copy, Ellipsis, FileText, Folder, Info, Link2, Loader2, Plus, RefreshCw, TriangleAlert, Unlink, X } from "lucide-react";
 import { DemoAction } from "@/components/demo-action";
+import { SessionContextPanel } from "@/components/session-context-panel";
 import { CodeBuddyAiIdeMark, CodeBuddyCnIdeMark, VscodeExtAiMark, VscodeExtMark, WorkBuddyAiMark, WorkBuddyMark } from "@/components/product-marks";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { AlertDialog, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from "@/components/ui/alert-dialog";
@@ -13,12 +14,14 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Skeleton } from "@/components/ui/skeleton";
 import { displayName } from "@/lib/account-display";
 import { accountVariant, variantIsIntl, variantLabel } from "@/lib/variant";
-import type { SessionGroupClient, SessionGroupCurrentAccount, SessionGroupDetail, SessionGroupMemberDetail, SessionGroupUnifyPlan } from "@/lib/types";
+import type { SessionGroupClient, SessionGroupCurrentAccount, SessionGroupDetail, SessionGroupMemberDetail, SessionGroupUnifyPlan, WbVariant } from "@/lib/types";
 import "./session-group-detail.css";
 
 export interface GroupDetailPanelProps {
   client: SessionGroupClient;
   detail: SessionGroupDetail | null;
+  /** 档位范围：只有 CodeBuddy IDE 需要；其余客户端传 undefined。 */
+  variantScope?: WbVariant;
   currentAccounts: SessionGroupCurrentAccount[];
   sourceMemberId: string;
   setSourceMemberId: (id: string) => void;
@@ -279,6 +282,7 @@ export function GroupDetailPanel(props: GroupDetailPanelProps) {
           {equal && <p className="mt-3 flex items-center justify-center gap-1.5 text-[11px] leading-4 text-muted-foreground"><Check className="size-3.5 shrink-0 text-brand" />有效关联内容一致，无需同步</p>}
         </div>
         <p className="mt-2 flex items-start gap-1.5 text-[11px] leading-4 text-muted-foreground"><Info className="mt-0.5 size-3 shrink-0" />{divergence ? "线条表示已验证的内容继承与分叉；不同颜色的分支互有新增，无法自动合并。" : conflict ? "连线只表示这些账号属于同一会话；不会自动选择要保留的内容。" : equal ? "账号更新后，可重新检查内容状态。" : "连线表示账号关联；仅在确认可安全补齐时提供批量同步。"}</p>
+        <SessionContextPanel client={props.client} groupId={detail.groupId} variantScope={props.variantScope} members={detail.members} disabled={props.busy} />
       </>}
     </div>
     {detail && <Popover open={props.addOpen} onOpenChange={(open) => { if (!open) props.setAddOpen(false); }}>

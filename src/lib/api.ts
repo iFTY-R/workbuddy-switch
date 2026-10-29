@@ -32,6 +32,9 @@ import type {
   SessionCopyReport,
   SessionBatchJob,
   SessionBatchTarget,
+  SessionContextBackfillReport,
+  SessionContextGcReport,
+  SessionContextIntegrity,
   SessionLinksPreview,
   SessionSyncReport,
   SessionSyncSelection,
@@ -169,6 +172,9 @@ const ROUTES: Record<string, Route> = {
   session_batch_cancel: { method: "POST", path: "/api/session-groups/batch-cancel" },
   session_batch_reports: { method: "POST", path: "/api/session-groups/batch-reports" },
   session_batch_latest_incomplete: { method: "POST", path: "/api/session-groups/batch-latest-incomplete" },
+  session_context_integrity: { method: "POST", path: "/api/session-context/integrity" },
+  session_context_backfill: { method: "POST", path: "/api/session-context/backfill" },
+  session_context_gc: { method: "POST", path: "/api/session-context/gc" },
   get_checkin_status: { method: "GET", path: "/api/checkin/status" },
   get_credit_expiry: { method: "POST", path: "/api/credits" },
   get_credit_statistics: { method: "GET", path: "/api/credits/stats" },
@@ -1198,6 +1204,58 @@ export function sessionBatchReports(limit = 5): Promise<SessionBatchJob[]> {
  */
 export function sessionBatchLatestIncomplete(): Promise<SessionBatchJob | null> {
   return call("session_batch_latest_incomplete");
+}
+
+/**
+ * 单个会话的上下文自检（只读）。
+ *
+ * 「上下文」不只有正文：文件备份、工具输出、计划/任务清单、用量行缺一条，
+ * 用户看到的就是「会话在、内容不对」。这里只报告事实，不写盘。
+ */
+export function sessionContextIntegrity(args: {
+  client: SessionGroupClient;
+  sessionId: string;
+}): Promise<SessionContextIntegrity> {
+  return call("session_context_integrity", {
+    client: args.client,
+    sessionId: args.sessionId,
+  });
+}
+
+/**
+ * 按关联组补齐上下文：以组内「安全来源」为源，把旁路数据补到其他成员名下。
+ *
+ * `apply` 缺省为 `false`，只报告每个目标缺多少悬空引用；确认后再用 `apply: true` 落盘。
+ * 搬运是追加式的（已存在即跳过），重复执行不会写第二份。
+ */
+export function sessionContextBackfill(args: {
+  client: SessionGroupClient;
+  groupIds: string[];
+  variantScope?: WbVariant;
+  apply?: boolean;
+}): Promise<SessionContextBackfillReport> {
+  return call("session_context_backfill", {
+    client: args.client,
+    groupIds: args.groupIds,
+    ...(args.variantScope ? { variantScope: args.variantScope } : {}),
+    ...(args.apply ? { apply: true } : {}),
+  });
+}
+
+/**
+ * 回收「没有会话行、也没有关联引用」的 `file-history/<id>/` 目录。
+ *
+ * 影响范围是**整个客户端**（不分会话组）。默认干跑，只列候选；`apply` 才真删，
+ * 且后端要求目录超过 7 天宽限期才会动手。
+ */
+export function sessionContextGc(args: {
+  client: SessionGroupClient;
+  apply?: boolean;
+}): Promise<SessionContextGcReport> {
+  return call("session_context_gc", {
+    client: args.client,
+    ...(args.apply ? { apply: true } : {}),
+  });
 }
 
 /**

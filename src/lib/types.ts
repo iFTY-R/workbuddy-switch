@@ -1135,3 +1135,68 @@ export interface SessionBatchTarget {
   key: string;
   groupId: string;
 }
+
+// ---------------------------------------------------------------------------
+// 会话上下文（正文之外的旁路数据）
+// ---------------------------------------------------------------------------
+
+/** 单个会话的上下文自检结果（与后端 `ContextIntegrity` 同形）。 */
+export interface SessionContextIntegrity {
+  sessionId: string;
+  /** 正文里引用的文件备份数量（去重）。 */
+  referenced: number;
+  /** 其中真实存在的数量。 */
+  present: number;
+  /** 悬空引用数量，等于 `referenced - present`。 */
+  missing: number;
+  /** 缺失样例（最多 5 个）。 */
+  missingSamples: string[];
+  fileHistoryDir: boolean;
+  /** 是否有 `tool-results/`：正文以绝对路径引用，缺了就断链。 */
+  toolResults: boolean;
+  todos: boolean;
+  tasks: boolean;
+  /** 是否有回滚日志。 */
+  rollback: boolean;
+  /** 是否有 `session_usage` 行（上下文用量）。 */
+  usage: boolean;
+}
+
+/** 回填时的一侧：`apply=false` 只报告缺多少，`apply=true` 才带上实际搬运结果。 */
+export interface SessionContextBackfillTarget {
+  memberId: string;
+  sessionId: string;
+  copied?: string[];
+  warnings?: string[];
+  /** 干跑时的悬空引用数；自检失败为 null。 */
+  missing?: number | null;
+}
+
+export interface SessionContextBackfillGroup {
+  groupId: string;
+  sourceSessionId: string;
+  targets: SessionContextBackfillTarget[];
+}
+
+export interface SessionContextBackfillReport {
+  applied: boolean;
+  groups: SessionContextBackfillGroup[];
+  copiedSidecars: number;
+  warnings: string[];
+}
+
+export interface SessionContextGcOrphan {
+  sessionId: string;
+  path: string;
+  ageDays: number;
+  removed?: boolean;
+  error?: string;
+}
+
+export interface SessionContextGcReport {
+  scanned: number;
+  orphans: SessionContextGcOrphan[];
+  removed: number;
+  /** false 为干跑：只列候选，不动磁盘。 */
+  applied: boolean;
+}

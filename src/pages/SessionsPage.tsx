@@ -651,6 +651,7 @@ export default function SessionsPage() {
   const detailPanel = (
     <GroupDetailPanel
       client={client} detail={detail} sourceMemberId={sourceMemberId}
+      variantScope={scope}
       currentAccounts={currentAccounts}
       setSourceMemberId={setSourceMemberId}
       addTargetId={addTargetId} setAddTargetId={setAddTargetId}

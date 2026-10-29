@@ -9,32 +9,42 @@ const POLL_INTERVAL = 600;
 /**
  * 按动作分派到对应的启动接口。
  *
- * 三个动作的入参不同（补副本要多带目标账号），所以这里显式分派而不是拼一个万能对象：
- * 少传字段应当由后端拒绝，而不是在这里被默认值悄悄补成别的语义。
+ * 用 `switch` + `never` 而不是 if 链：if 链的兜底分支必须是某个具体动作，新增第四个动作
+ * 却忘了写分支时，会**静默**走到那个兜底（若兜底是 delete，等于误删）。这里的 `default`
+ * 断言穷尽性，漏分支直接编译失败。
+ *
+ * 三个动作的入参也不同（补副本要多带目标账号），所以显式分派：少传字段应当由后端拒绝，
+ * 而不是在这里被默认值悄悄补成别的语义。
  */
 function startJob(args: StartBatchArgs): Promise<{ jobId: string }> {
-  if (args.op === "sync") {
-    return api.startSessionBatchSync({
-      client: args.client,
-      groups: args.groups,
-      variantScope: args.variantScope,
-      allowRestart: args.allowRestart,
-    });
+  switch (args.op) {
+    case "sync":
+      return api.startSessionBatchSync({
+        client: args.client,
+        groups: args.groups,
+        variantScope: args.variantScope,
+        allowRestart: args.allowRestart,
+      });
+    case "copy":
+      return api.startSessionBatchCopy({
+        client: args.client,
+        groups: args.groups,
+        targetAccountIds: args.targetAccountIds ?? [],
+        variantScope: args.variantScope,
+        allowRestart: args.allowRestart,
+      });
+    case "delete":
+      return api.startSessionBatchDelete({
+        client: args.client,
+        groups: args.groups,
+        variantScope: args.variantScope,
+      });
+    default: {
+      // 走到这里说明 SessionBatchOp 加了新值但没写分支：让编译器先报错。
+      const unreachable: never = args.op;
+      return Promise.reject(new Error(`未知的批量动作：${String(unreachable)}`));
+    }
   }
-  if (args.op === "copy") {
-    return api.startSessionBatchCopy({
-      client: args.client,
-      groups: args.groups,
-      targetAccountIds: args.targetAccountIds ?? [],
-      variantScope: args.variantScope,
-      allowRestart: args.allowRestart,
-    });
-  }
-  return api.startSessionBatchDelete({
-    client: args.client,
-    groups: args.groups,
-    variantScope: args.variantScope,
-  });
 }
 
 export interface StartBatchArgs {

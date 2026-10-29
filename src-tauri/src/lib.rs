@@ -266,6 +266,7 @@ pub fn run() {
             commands::session_context_integrity,
             commands::session_context_backfill,
             commands::session_context_gc,
+            commands::account_memory_preview,
             commands::save_text_file,
             commands::add_session_group_member,
             commands::copy_linked_sessions,

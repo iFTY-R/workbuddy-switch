@@ -19,6 +19,7 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 
 use crate::modules::account;
+use crate::modules::account_memory;
 use crate::modules::auth_file;
 use crate::modules::process::{close_workbuddy, launch_workbuddy};
 use crate::modules::session::{self, SessionPaths, SyncSelection};
@@ -133,19 +134,47 @@ fn reject_session_writes_without_restart(
     (copy, sync)
 }
 
+/// 切号时可一并执行的动作。
+///
+/// 五个字段都是「可选附加动作」：切号本身只依赖账号 id 与是否重启。
+/// 收成一个结构体是为了让调用方按名字填——一长串 `bool` 参数迟早会被传错位置，
+/// 而这里传错一个的后果是「该复制的没复制、该覆盖的没覆盖」。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SwitchActions<'a> {
+    /// 旧版「共享会话」兼容开关（Rust 版未实现，只在报告里说明）。
+    pub share_sessions: bool,
+    /// 要复制给目标账号的源会话 id（新 id，云端可同步）。
+    pub copy_session_ids: &'a [String],
+    /// 要同步的关联会话（保留目标 sessionId 与标题）。
+    pub sync_selections: &'a [SyncSelection],
+    /// 把**切换前**账号的记忆带给目标账号。
+    pub migrate_memory: bool,
+    /// 覆盖目标账号已有的记忆；仅 `migrate_memory` 为真时有意义。
+    pub memory_overwrite: bool,
+}
+
 /// 切换账号。
 ///
-/// `copy_session_ids` 非空时按路径 B 复制勾选会话（新 id，云端可同步）；
-/// `sync_selections` 非空时把来源账号的新增内容同步到目标账号的关联会话（保留目标
+/// `actions.copy_session_ids` 非空时按路径 B 复制勾选会话（新 id，云端可同步）；
+/// `actions.sync_selections` 非空时把来源账号的新增内容同步到目标账号的关联会话（保留目标
 /// sessionId、标题与自定义标题）。两者共用同一把档位操作锁，顺序执行、不重复写入。
+///
+/// `actions.migrate_memory` 为真时把**切换前**账号的记忆带给目标账号；
+/// `actions.memory_overwrite` 只在目标已有记忆时才有意义——不带它一律拒绝覆盖，
+/// 避免静默替换别人的记忆。
 pub fn switch_account(
     progress_fn: Option<&ProgressFn>,
     account_id: &str,
     restart: bool,
-    share_sessions: bool,
-    copy_session_ids: &[String],
-    sync_selections: &[SyncSelection],
+    actions: &SwitchActions<'_>,
 ) -> Result<Value, String> {
+    let SwitchActions {
+        share_sessions,
+        copy_session_ids,
+        sync_selections,
+        migrate_memory,
+        memory_overwrite,
+    } = *actions;
     let progress = |message: &str| {
         eprintln!("[switch] progress: {message}");
         if let Some(p) = progress_fn {
@@ -158,12 +187,17 @@ pub fn switch_account(
         account::find_account(account_id).ok_or_else(|| format!("账号不存在: {account_id}"))?;
     // 档位以账号自身为准：签名里的参数无法表达「用 A 档位操作 B 档位账号」。
     let variant = account::variant_of(&acc);
+    // 迁移记忆的来源是**切换前**的登录账号：一旦写下认证文件就读不到了，所以先取。
+    let previous_uid = migrate_memory
+        .then(|| session::current_user_uid(variant))
+        .flatten();
     let backup = auth_file::backup_auth_file(variant);
 
     let mut copy_report: Option<Value> = None;
     let mut session_report: Option<Value> = None;
     let mut sync_report: Option<Value> = None;
     let mut recovery_report: Option<Value> = None;
+    let mut memory_report: Option<Value> = None;
     if restart {
         progress("正在关闭 WorkBuddy…");
         close_workbuddy(variant, 20)?;
@@ -272,6 +306,18 @@ pub fn switch_account(
     }
     progress("正在写入认证文件…");
     auth_file::write_account_to_auth_file(&acc, variant)?;
+    // 记忆迁移放在「写认证之后、启动之前」：客户端启动时就会读这份文件，
+    // 晚了会读到旧内容；而来源 uid 已在函数开头取好，此时仍可用。
+    // 迁移失败只进报告、不阻断切号——记忆是增强项，不能让它把账号切换卡住。
+    if migrate_memory {
+        progress("正在迁移账号记忆…");
+        memory_report = Some(migrate_memory_report(
+            variant,
+            previous_uid.as_deref(),
+            &acc,
+            memory_overwrite,
+        ));
+    }
     if restart {
         progress("正在启动 WorkBuddy…");
         launch_workbuddy(variant, Some(&progress))?;
@@ -284,6 +330,9 @@ pub fn switch_account(
         "variant": variant.as_str(),
         "backup": backup.map(|p| p.to_string_lossy().to_string()),
     });
+    if let Some(memory) = memory_report {
+        result["memoryMigration"] = memory;
+    }
     if let Some(c) = copy_report {
         result["sessionCopy"] = c;
     }
@@ -297,6 +346,45 @@ pub fn switch_account(
         result["sessionRecovery"] = r;
     }
     Ok(result)
+}
+
+/// 记忆迁移的报告：成功给回执、失败给原因、缺来源给跳过理由。
+///
+/// 三种结局都不改变切号结果，所以统一收敛成一个 JSON，由前端决定怎么展示：
+/// 记忆是增强项，任何情况都不该让「账号已经切过去了」这件事变成失败。
+///
+/// 调用点严格落在「写认证之后、启动之前」：来源 uid 在函数开头就已取好
+/// （写认证之后就只剩目标账号了），而客户端启动时会立刻读记忆文件。
+fn migrate_memory_report(
+    variant: WbVariant,
+    source_uid: Option<&str>,
+    target: &Value,
+    overwrite: bool,
+) -> Value {
+    let target_uid = account::get_str(target, "uid").unwrap_or_default();
+    let target_uid = target_uid.trim();
+    let Some(source_uid) = source_uid.map(str::trim).filter(|uid| !uid.is_empty()) else {
+        return json!({"status": "skipped", "reason": "没有读到切换前的登录账号，无法确定记忆来源"});
+    };
+    if target_uid.is_empty() {
+        return json!({"status": "skipped", "reason": "目标账号缺少 uid，无法确定写入位置"});
+    }
+    match account_memory::apply(variant, source_uid, target_uid, overwrite) {
+        Ok(report) => json!({
+            "status": "copied",
+            "sourceUid": source_uid,
+            "targetUid": target_uid,
+            "report": report,
+        }),
+        // 目标已有记忆且未显式要求覆盖：这里如实回报「未覆盖」，
+        // 而不是替用户决定替换——那是删掉目标账号记忆的行为。
+        Err(reason) => json!({
+            "status": "skipped",
+            "sourceUid": source_uid,
+            "targetUid": target_uid,
+            "reason": reason,
+        }),
+    }
 }
 
 #[cfg(test)]

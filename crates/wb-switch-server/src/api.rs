@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use wb_switch_core::modules::lock_or_recover;
 
 use wb_switch_core::modules::{
-    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
+    account, account_memory, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
     codebuddy_ide_session, codebuddy_ide_session_sync, config, credit_usage, credits,
     export_import, jetbrains, limits, notifications, oauth, process, rate_limit_events,
     rate_limit_hook, refresh, rotate, session, session_batch, session_context, session_groups,
@@ -288,6 +288,10 @@ pub fn router() -> Router {
             post(api_session_context_backfill),
         )
         .route("/api/session-context/gc", post(api_session_context_gc))
+        .route(
+            "/api/account-memory/preview",
+            post(api_account_memory_preview),
+        )
         .route(
             "/api/session-groups/copy-linked",
             post(api_copy_linked_sessions),
@@ -953,6 +957,16 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
         Ok(selections) => selections,
         Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
     };
+    // 默认不迁移记忆：这是「把上一个账号的记忆带到新账号」，必须由用户显式勾选。
+    let migrate_memory = body
+        .get("migrateMemory")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    // 覆盖目标账号已有的记忆：只在 migrateMemory 为真时才有意义，同样默认关闭。
+    let memory_overwrite = body
+        .get("memoryOverwrite")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     {
         let mut running = lock_or_recover(&SWITCH_RUNNING);
@@ -977,9 +991,13 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
             Some(&progress),
             &account_id,
             restart,
-            share_sessions,
-            &copy_ids,
-            &sync_selections,
+            &switch::SwitchActions {
+                share_sessions,
+                copy_session_ids: &copy_ids,
+                sync_selections: &sync_selections,
+                migrate_memory,
+                memory_overwrite,
+            },
         )
     })
     .await;
@@ -1470,10 +1488,20 @@ async fn api_session_context_gc(Json(body): Json<Value>) -> Response {
     }
 }
 
+/// 记忆迁移预检（只读）：源是当前登录账号，目标是 `accountId` 指向的账号。
+async fn api_account_memory_preview(Json(body): Json<Value>) -> Response {
+    let Some(account_id) = body.get("accountId").and_then(Value::as_str) else {
+        return json_err("缺少 accountId".to_string(), StatusCode::BAD_REQUEST);
+    };
+    match account_memory::preview_for_account(account_id) {
+        Ok(preview) => json_ok(serde_json::to_value(preview).unwrap_or(Value::Null)),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
 async fn api_session_batch_latest_incomplete() -> Response {
     json_ok(session_batch::latest_incomplete_report())
 }
-
 async fn api_session_batch_reports(Json(body): Json<Value>) -> Response {
     let limit = body
         .get("limit")

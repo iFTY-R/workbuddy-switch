@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 
 use tauri::Emitter;
 use wb_switch_core::modules::{
-    account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
+    account, account_memory, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
     codebuddy_ide_session, codebuddy_ide_session_sync, credit_usage, credits, error_log,
     export_import, jetbrains, limits, notifications, oauth, process, rate_limit_events,
     rate_limit_hook, refresh, rotate, session, session_batch, session_context, session_groups,
@@ -579,6 +579,8 @@ pub async fn switch_account(
     share_sessions: Option<bool>,
     copy_session_ids: Option<Vec<String>>,
     sync_selections: Option<Value>,
+    migrate_memory: Option<bool>,
+    memory_overwrite: Option<bool>,
 ) -> Result<Value, String> {
     if account_id.trim().is_empty() {
         return Err("缺少 accountId".to_string());
@@ -586,6 +588,10 @@ pub async fn switch_account(
     let restart = restart.unwrap_or(true);
     let share_sessions = share_sessions.unwrap_or(false);
     let copy_ids = copy_session_ids.unwrap_or_default();
+    // 记忆迁移默认关闭：把上一个账号的记忆带到新账号是显式选择。
+    let migrate_memory = migrate_memory.unwrap_or(false);
+    // 覆盖目标记忆同样默认关闭；只有用户看到「目标已有记忆」后主动勾选才生效。
+    let memory_overwrite = memory_overwrite.unwrap_or(false);
     // 入参形状由 core 校验（缺 groupId / previewToken / mode 一律拒绝）；这里只做透传，
     // 不在命令层做业务判定。
     let sync_selections = session::parse_sync_selections(sync_selections.as_ref())?;
@@ -597,9 +603,13 @@ pub async fn switch_account(
             Some(&progress),
             &account_id,
             restart,
-            share_sessions,
-            &copy_ids,
-            &sync_selections,
+            &switch::SwitchActions {
+                share_sessions,
+                copy_session_ids: &copy_ids,
+                sync_selections: &sync_selections,
+                migrate_memory,
+                memory_overwrite,
+            },
         )
     })
     .await
@@ -1566,6 +1576,13 @@ pub async fn session_context_backfill(
 pub async fn session_context_gc(client: String, apply: Option<bool>) -> Result<Value, String> {
     let client = session_groups::SessionClient::parse(&client)?;
     session_context::gc_for(client, apply.unwrap_or(false))
+}
+
+/// 记忆迁移预检（只读）：源是当前登录账号，目标是 `account_id` 指向的账号。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn account_memory_preview(account_id: String) -> Result<Value, String> {
+    let preview = account_memory::preview_for_account(&account_id)?;
+    Ok(serde_json::to_value(preview).unwrap_or(Value::Null))
 }
 
 /// 把文本写到用户选定的绝对路径（导出批量报告用，仅桌面端）。

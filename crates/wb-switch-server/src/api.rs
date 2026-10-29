@@ -24,8 +24,9 @@ use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
     codebuddy_ide_session, codebuddy_ide_session_sync, config, credit_usage, credits,
     export_import, jetbrains, limits, notifications, oauth, process, rate_limit_events,
-    rate_limit_hook, refresh, rotate, session, session_batch, session_groups, switch, token_stats,
-    travel, update, variant::WbVariant, vscode_ext, vscode_session, vscode_session_sync,
+    rate_limit_hook, refresh, rotate, session, session_batch, session_context, session_groups,
+    switch, token_stats, travel, update, variant::WbVariant, vscode_ext, vscode_session,
+    vscode_session_sync,
 };
 
 /// WorkBuddy 运行状态缓存：Windows 上检测要跑 tasklist（慢），缓存几秒避免
@@ -278,6 +279,15 @@ pub fn router() -> Router {
             "/api/session-groups/batch-latest-incomplete",
             post(api_session_batch_latest_incomplete),
         )
+        .route(
+            "/api/session-context/integrity",
+            post(api_session_context_integrity),
+        )
+        .route(
+            "/api/session-context/backfill",
+            post(api_session_context_backfill),
+        )
+        .route("/api/session-context/gc", post(api_session_context_gc))
         .route(
             "/api/session-groups/copy-linked",
             post(api_copy_linked_sessions),
@@ -1401,6 +1411,58 @@ async fn api_session_batch_cancel(Json(body): Json<Value>) -> Response {
     match session_batch::cancel(job_id) {
         Ok(value) => json_ok(value),
         Err(error) => json_err(error, StatusCode::NOT_FOUND),
+    }
+}
+
+/// 会话上下文自检（只读）。
+async fn api_session_context_integrity(Json(body): Json<Value>) -> Response {
+    let (client, _) = match session_group_request(&body) {
+        Ok(value) => value,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let Some(session_id) = body.get("sessionId").and_then(Value::as_str) else {
+        return json_err("缺少 sessionId".to_string(), StatusCode::BAD_REQUEST);
+    };
+    match session_context::integrity_for(client, session_id) {
+        Ok(integrity) => json_ok(serde_json::to_value(integrity).unwrap_or(Value::Null)),
+        Err(error) => json_err(error, StatusCode::NOT_FOUND),
+    }
+}
+
+/// 按关联组回填旁路数据；`apply` 缺省为 false（只报告）。
+async fn api_session_context_backfill(Json(body): Json<Value>) -> Response {
+    let (client, scope) = match session_group_request(&body) {
+        Ok(value) => value,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let group_ids: Vec<String> = body
+        .get("groupIds")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|item| item.as_str().map(str::to_string))
+        .collect();
+    if group_ids.is_empty() {
+        return json_err("缺少 groupIds".to_string(), StatusCode::BAD_REQUEST);
+    }
+    let apply = body.get("apply").and_then(Value::as_bool).unwrap_or(false);
+    match session_context::backfill_group_context(client, scope, &group_ids, apply) {
+        Ok(report) => json_ok(report),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// 回收孤儿 `file-history` 目录；`apply` 缺省 false（干跑）。
+async fn api_session_context_gc(Json(body): Json<Value>) -> Response {
+    let (client, _) = match session_group_request(&body) {
+        Ok(value) => value,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let apply = body.get("apply").and_then(Value::as_bool).unwrap_or(false);
+    match session_context::gc_for(client, apply) {
+        Ok(report) => json_ok(report),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
     }
 }
 

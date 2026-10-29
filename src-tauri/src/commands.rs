@@ -11,8 +11,9 @@ use wb_switch_core::modules::{
     account, auth_file, checkin, codebuddy_cli, codebuddy_cn_ide, codebuddy_ide,
     codebuddy_ide_session, codebuddy_ide_session_sync, credit_usage, credits, error_log,
     export_import, jetbrains, limits, notifications, oauth, process, rate_limit_events,
-    rate_limit_hook, refresh, rotate, session, session_batch, session_groups, switch, token_stats,
-    travel, update, variant::WbVariant, vscode_ext, vscode_session, vscode_session_sync,
+    rate_limit_hook, refresh, rotate, session, session_batch, session_context, session_groups,
+    switch, token_stats, travel, update, variant::WbVariant, vscode_ext, vscode_session,
+    vscode_session_sync,
 };
 
 #[derive(Serialize)]
@@ -1534,6 +1535,37 @@ pub async fn session_batch_latest_incomplete() -> Value {
 #[tauri::command(rename_all = "camelCase")]
 pub async fn session_batch_reports(limit: Option<usize>) -> Value {
     session_batch::recent_reports(limit.unwrap_or(5))
+}
+
+/// 会话上下文自检（只读）：正文引用的文件备份有多少真实存在，计划/用量是否齐全。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn session_context_integrity(
+    client: String,
+    session_id: String,
+) -> Result<Value, String> {
+    let client = session_groups::SessionClient::parse(&client)?;
+    let integrity = session_context::integrity_for(client, &session_id)?;
+    Ok(serde_json::to_value(integrity).unwrap_or(Value::Null))
+}
+
+/// 按关联组回填旁路数据（`apply=false` 只报告将要补什么，不写盘）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn session_context_backfill(
+    client: String,
+    variant_scope: Option<String>,
+    group_ids: Vec<String>,
+    apply: Option<bool>,
+) -> Result<Value, String> {
+    let client = session_groups::SessionClient::parse(&client)?;
+    let scope = session_groups::parse_variant_scope(variant_scope.as_deref())?;
+    session_context::backfill_group_context(client, scope, &group_ids, apply.unwrap_or(false))
+}
+
+/// 回收无主的 `file-history/<id>/` 目录；默认干跑，`apply=true` 才删除。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn session_context_gc(client: String, apply: Option<bool>) -> Result<Value, String> {
+    let client = session_groups::SessionClient::parse(&client)?;
+    session_context::gc_for(client, apply.unwrap_or(false))
 }
 
 /// 把文本写到用户选定的绝对路径（导出批量报告用，仅桌面端）。

@@ -1404,11 +1404,11 @@ fn write_copy_body(
 /// 只改正文里的 sessionId、不搬这三处，副本就会带着一堆指向不存在路径的引用：
 /// 会话内容看着还在，文件历史与计划上下文却全丢了——表现就是「关联成功、上下文不对」。
 #[derive(Debug, Default)]
-struct SidecarCopy {
+pub(crate) struct SidecarCopy {
     /// 实际复制成功的种类（`fileHistory` / `todos` / `tasks`）。
-    copied: Vec<&'static str>,
+    pub(crate) copied: Vec<&'static str>,
     /// 单项失败原因：旁路数据缺失不该让主复制失败，但必须如实上报。
-    warnings: Vec<String>,
+    pub(crate) warnings: Vec<String>,
 }
 
 /// 会话 id 能否安全地当作路径段：这些名字会拼进 `file-history/<id>/` 与
@@ -1423,7 +1423,7 @@ fn is_session_id_like(value: &str) -> bool {
 }
 
 /// 把源会话的旁路数据复制到新会话 id 下（幂等：已存在的文件跳过）。
-fn copy_session_sidecars(
+pub(crate) fn copy_session_sidecars(
     source_paths: &SessionPaths,
     target_paths: &SessionPaths,
     cid: &str,

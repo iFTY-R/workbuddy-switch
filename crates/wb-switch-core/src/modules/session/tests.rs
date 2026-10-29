@@ -6200,9 +6200,16 @@ fn copy_carries_file_history_and_todos_to_new_session_id() {
     let todos = env.paths.data_root.join("todos").join("sess-1.json");
     std::fs::create_dir_all(todos.parent().unwrap()).unwrap();
     std::fs::write(&todos, br#"{"todos":[{"id":"t1","status":"pending"}]}"#).unwrap();
-    let tasks = env.paths.data_root.join("tasks").join("sess-1.json");
-    std::fs::create_dir_all(tasks.parent().unwrap()).unwrap();
-    std::fs::write(&tasks, br#"{"tasks":[]}"#).unwrap();
+    // 任务清单是目录：`tasks/<sid>/<taskId>.json`（客户端 writeTasks 就是这么写的）。
+    let tasks = env.paths.data_root.join("tasks").join("sess-1");
+    std::fs::create_dir_all(&tasks).unwrap();
+    std::fs::write(tasks.join("1.json"), br#"{"id":"1","subject":"t"}"#).unwrap();
+    // 工具输出与回滚日志挂在正文所在的工作区目录下。
+    let workspace = env.paths.projects_dir().join("ws-a");
+    let tool_results = workspace.join("sess-1").join("tool-results");
+    std::fs::create_dir_all(&tool_results).unwrap();
+    std::fs::write(tool_results.join("call_1-render.txt"), b"large output").unwrap();
+    std::fs::write(workspace.join("sess-1.file-rollback.ndjson"), b"{}\n").unwrap();
 
     let report = copy(&env, "uid-b", &["sess-1"]);
     let new_id = env.first_copy_id(&report);
@@ -6231,11 +6238,35 @@ fn copy_carries_file_history_and_todos_to_new_session_id() {
         r#"{"todos":[{"id":"t1","status":"pending"}]}"#,
         "计划清单要跟着搬"
     );
+    assert!(
+        env.paths
+            .data_root
+            .join("tasks")
+            .join(&new_id)
+            .join("1.json")
+            .is_file(),
+        "任务清单按目录搬"
+    );
+    // 正文里的 tool-results 是绝对路径，且会话 id 会被替换成新 id：
+    // 不搬到 `<new_id>/tool-results`，副本里每一条 `<persisted-output>` 都是死链。
+    assert_eq!(
+        std::fs::read(
+            env.paths
+                .projects_dir()
+                .join("ws-a")
+                .join(&new_id)
+                .join("tool-results")
+                .join("call_1-render.txt")
+        )
+        .unwrap(),
+        b"large output",
+        "工具输出必须跟到新会话 id 下"
+    );
     assert!(env
         .paths
-        .data_root
-        .join("tasks")
-        .join(format!("{new_id}.json"))
+        .projects_dir()
+        .join("ws-a")
+        .join(format!("{new_id}.file-rollback.ndjson"))
         .is_file());
 
     let sidecars: Vec<&str> = report["copied"][0]["sidecars"]
@@ -6245,8 +6276,10 @@ fn copy_carries_file_history_and_todos_to_new_session_id() {
         .filter_map(Value::as_str)
         .collect();
     assert!(sidecars.contains(&"fileHistory"), "{report}");
+    assert!(sidecars.contains(&"toolResults"), "{report}");
     assert!(sidecars.contains(&"todos"), "{report}");
     assert!(sidecars.contains(&"tasks"), "{report}");
+    assert!(sidecars.contains(&"rollback"), "{report}");
     assert!(
         report["copied"][0]["sidecarWarnings"].is_null(),
         "没有失败就不该报警告：{report}"

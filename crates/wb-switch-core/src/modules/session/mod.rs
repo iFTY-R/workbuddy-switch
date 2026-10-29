@@ -612,6 +612,11 @@ fn copy_visibility_override(
         "agent_dirty" | "agent_dirty_at" | "agent_last_synced" => {
             (!matches!(inherited, Value::Null)).then_some(Value::Null)
         }
+        // 快照行属于「本档本地库」（`buddy_snapshots` 不带账号维度，主键是 snapshot_id）。
+        // 同档复制时沿用是安全的，但跨档复制后该 id 在目标库里可能根本不存在，
+        // 客户端按 `buddy_snapshot_id` 反查会得到空。清掉比留一个悬空引用更诚实：
+        // 会话本身仍能打开，只是少了绑定快照那一层展示。
+        "buddy_snapshot_id" => (!matches!(inherited, Value::Null)).then_some(Value::Null),
         _ => None,
     }
 }
@@ -1393,19 +1398,35 @@ fn write_copy_body(
     }
 }
 
+/// 客户端在 `projects/<workspace>/<cid>/` 下存放的单会话目录（工具输出）。
+const TOOL_RESULTS_DIR: &str = "tool-results";
+/// 与正文并排的回滚日志：`<cid>.file-rollback.ndjson`。
+const ROLLBACK_SUFFIX: &str = ".file-rollback.ndjson";
+
 /// 复制会话时一并搬运的旁路数据（正文之外、按会话 id 存放）。
 ///
 /// 客户端打开一个会话，读的不只是 `projects/<workspace>/<cid>.jsonl`：
 /// - `file-history/<cid>/<hash>@vN` —— 每一步的文件备份。正文里
 ///   `snapshot.trackedFileBackups[*].backupFileName` 存的是 `<hash>@vN`，
 ///   而**目录名才是会话 id**，由客户端的 `PathMapper` 拼出来；
-/// - `todos/<cid>.json` / `tasks/<cid>.json` —— 计划与任务清单。
+/// - `projects/<workspace>/<cid>/tool-results/*` —— 超长工具输出。正文里存的是
+///   **绝对路径**（`<persisted-output>` 段落），而正文里的会话 id 会被整体替换成
+///   新 id，路径随之指向 `<new_cid>/tool-results`：不搬这一份，副本里每一条
+///   `<persisted-output>` 都是死链（实测单个大会话 143 处）。
+/// - `todos/<cid>.json` —— 计划清单（单文件）；
+/// - `tasks/<cid>/<taskId>.json` —— 任务清单（**目录**，不是 `<cid>.json`）；
+/// - `projects/<workspace>/<cid>.file-rollback.ndjson` —— 回滚日志。
 ///
-/// 只改正文里的 sessionId、不搬这三处，副本就会带着一堆指向不存在路径的引用：
+/// 只改正文里的 sessionId、不搬这些，副本就会带着一堆指向不存在路径的引用：
 /// 会话内容看着还在，文件历史与计划上下文却全丢了——表现就是「关联成功、上下文不对」。
+///
+/// 明确**不搬**（体积与用途都不适合跟着副本走）：`workspace/sessions/<cid>/`
+/// （文件快照，实测可达数 GB）、`file-tree-manifests/`、`changes-index|changes-detail/`、
+/// `artifact-index/`。这些只服务于「变更 / 产物」面板，缺了不影响会话能否正常打开。
 #[derive(Debug, Default)]
 pub(crate) struct SidecarCopy {
-    /// 实际复制成功的种类（`fileHistory` / `todos` / `tasks`）。
+    /// 实际复制成功的种类
+    /// （`fileHistory` / `toolResults` / `todos` / `tasks` / `rollback`）。
     pub(crate) copied: Vec<&'static str>,
     /// 单项失败原因：旁路数据缺失不该让主复制失败，但必须如实上报。
     pub(crate) warnings: Vec<String>,
@@ -1420,6 +1441,24 @@ fn is_session_id_like(value: &str) -> bool {
         && value
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+}
+
+/// 源 / 目标两侧的「工作区目录」：正文所在的 `projects/<workspace>/`。
+///
+/// 目标侧沿用源侧的工作区目录名（跨档一致，与 [`target_body_path`] 同一条规则）；
+/// 源正文找不到时返回 `None`，调用方跳过工作区内的旁路数据即可。
+fn session_workspace_dirs(
+    source_paths: &SessionPaths,
+    target_paths: &SessionPaths,
+    cid: &str,
+) -> Option<(PathBuf, PathBuf)> {
+    let body = find_project_jsonl(source_paths, cid)?;
+    let parent = body.parent()?;
+    let relative = parent.strip_prefix(source_paths.projects_dir()).ok()?;
+    Some((
+        parent.to_path_buf(),
+        target_paths.projects_dir().join(relative),
+    ))
 }
 
 /// 把源会话的旁路数据复制到新会话 id 下（幂等：已存在的文件跳过）。
@@ -1457,32 +1496,72 @@ pub(crate) fn copy_session_sidecars(
         }
     }
 
-    // 2) 计划 / 任务清单：单文件，内容里不含会话 id。
-    for (kind, dir) in [("todos", "todos"), ("tasks", "tasks")] {
-        let src = source_paths.data_root.join(dir).join(format!("{cid}.json"));
-        if !src.is_file() {
-            continue;
+    // 2) 工作区内按会话 id 存放的两项：工具输出目录、回滚日志。
+    if let Some((source_ws, target_ws)) = session_workspace_dirs(source_paths, target_paths, cid) {
+        let src_tools = source_ws.join(cid).join(TOOL_RESULTS_DIR);
+        if src_tools.is_dir() {
+            let dst_tools = target_ws.join(new_cid).join(TOOL_RESULTS_DIR);
+            match copy_dir_additive(&src_tools, &dst_tools) {
+                Ok(files) if files > 0 => result.copied.push("toolResults"),
+                Ok(_) => {}
+                Err(error) => result.warnings.push(format!(
+                    "工具输出复制失败（{error}），副本里超长输出会显示为死链"
+                )),
+            }
         }
+
+        let src_rollback = source_ws.join(format!("{cid}{ROLLBACK_SUFFIX}"));
+        if src_rollback.is_file() {
+            let dst_rollback = target_ws.join(format!("{new_cid}{ROLLBACK_SUFFIX}"));
+            match copy_file_durable(&src_rollback, &dst_rollback) {
+                Ok(()) => result.copied.push("rollback"),
+                Err(error) => result.warnings.push(format!(
+                    "回滚日志复制失败（{error}），副本将无法回滚此前的文件改动"
+                )),
+            }
+        }
+    }
+
+    // 3) 计划清单：单文件，内容里不含会话 id。
+    let src_todos = source_paths
+        .data_root
+        .join("todos")
+        .join(format!("{cid}.json"));
+    if src_todos.is_file() {
         let dst = target_paths
             .data_root
-            .join(dir)
+            .join("todos")
             .join(format!("{new_cid}.json"));
-        let copied = std::fs::read(&src)
-            .map_err(|error| error.to_string())
-            .and_then(|bytes| {
-                if let Some(parent) = dst.parent() {
-                    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-                }
-                session_backup::durable_write(&dst, &bytes).map_err(|error| error.to_string())
-            });
-        match copied {
-            Ok(()) => result.copied.push(kind),
+        match copy_file_durable(&src_todos, &dst) {
+            Ok(()) => result.copied.push("todos"),
             Err(error) => result
                 .warnings
-                .push(format!("{kind} 复制失败（{error}），副本将缺少计划上下文")),
+                .push(format!("todos 复制失败（{error}），副本将缺少计划上下文")),
+        }
+    }
+
+    // 4) 任务清单：`tasks/<cid>/<taskId>.json` 是**目录**，按目录搬。
+    let src_tasks = source_paths.data_root.join("tasks").join(cid);
+    if src_tasks.is_dir() {
+        let dst_tasks = target_paths.data_root.join("tasks").join(new_cid);
+        match copy_dir_additive(&src_tasks, &dst_tasks) {
+            Ok(files) if files > 0 => result.copied.push("tasks"),
+            Ok(_) => {}
+            Err(error) => result
+                .warnings
+                .push(format!("任务清单复制失败（{error}），副本将缺少执行计划")),
         }
     }
     result
+}
+
+/// 单文件旁路复制：先建父目录，再按「会话专用持久化写」落盘。
+fn copy_file_durable(src: &Path, dst: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(src).map_err(|error| error.to_string())?;
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    session_backup::durable_write(dst, &bytes).map_err(|error| error.to_string())
 }
 
 /// 同步用的旁路镜像：把**源会话**的旁路数据补到**目标会话**名下。
@@ -1529,12 +1608,24 @@ fn copy_dir_additive(src: &Path, dst: &Path) -> Result<usize, String> {
             if target.exists() {
                 continue;
             }
-            let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
-            session_backup::durable_write(&target, &bytes).map_err(|error| error.to_string())?;
+            // 单文件可能很大（工具输出），用流式 copy 而不是整篇读进内存；
+            // 落盘后收紧权限，与会话文件的默认私有策略保持一致。
+            copy_file_private(&path, &target)?;
             copied += 1;
         }
     }
     Ok(copied)
+}
+
+/// 流式复制单个文件，并在 Unix 上收紧到 `0600`。
+fn copy_file_private(src: &Path, dst: &Path) -> Result<(), String> {
+    std::fs::copy(src, dst).map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 /// 首次使用时先落地空的关联存储。

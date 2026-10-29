@@ -4,11 +4,19 @@
 //! - `file-history/<sessionId>/<hash>@vN`：每一步的文件备份。正文里
 //!   `snapshot.trackedFileBackups[*].backupFileName` 存的是 `<hash>@vN`，
 //!   目录名才是会话 id（客户端 `PathMapper` 就是这么拼的）；
-//! - `todos/<sessionId>.json`、`tasks/<sessionId>.json`：计划与任务清单；
+//! - `projects/<workspace>/<sessionId>/tool-results/*`：超长工具输出。正文里存的是
+//!   **绝对路径**，所以这一份缺了就是死链（`<persisted-output>` 指向不存在的文件）；
+//! - `todos/<sessionId>.json`：计划清单；
+//! - `tasks/<sessionId>/<taskId>.json`：任务清单（**目录**，不是 `<sessionId>.json`）；
+//! - `<sessionId>.file-rollback.ndjson`：与正文并排的回滚日志；
 //! - `session_usage` 行：`used` 是当前上下文占用、`size` 是窗口。
 //!
 //! 复制 / 同步漏搬其中任何一处，正文还在但引用悬空——用户看到的就是
 //! 「会话关联了、上下文不对」。本模块只做三件事：**量出来**、**补齐**、**清孤儿**。
+//!
+//! 明确不在自检范围内（体积与用途都不适合跟着副本走，缺了不影响会话打开）：
+//! `workspace/sessions/<sessionId>/`（文件快照，实测可达数 GB）、
+//! `file-tree-manifests/`、`changes-index|changes-detail/`、`artifact-index/`。
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -40,8 +48,12 @@ pub struct ContextIntegrity {
     pub missing_samples: Vec<String>,
     /// 是否已有 `file-history/<sessionId>/` 目录。
     pub file_history_dir: bool,
+    /// 是否有 `projects/<workspace>/<sessionId>/tool-results/`（正文以绝对路径引用）。
+    pub tool_results: bool,
     pub todos: bool,
     pub tasks: bool,
+    /// 是否有回滚日志 `<sessionId>.file-rollback.ndjson`。
+    pub rollback: bool,
     pub usage: bool,
 }
 
@@ -83,6 +95,12 @@ pub fn context_integrity(
         }
     }
     let referenced_count = referenced.len();
+    // 工作区目录名随 cwd 的编码而变，按正文所在目录反推，不猜编码规则。
+    let projects = paths.projects_dir();
+    let workspace_session = body
+        .parent()
+        .filter(|parent| *parent != projects.as_path())
+        .map(|parent| parent.join(session_id));
     Ok(ContextIntegrity {
         session_id: session_id.to_string(),
         referenced: referenced_count,
@@ -90,16 +108,20 @@ pub fn context_integrity(
         missing: referenced_count - present,
         missing_samples,
         file_history_dir: history_dir.is_dir(),
+        tool_results: workspace_session
+            .as_ref()
+            .is_some_and(|dir| dir.join("tool-results").is_dir()),
         todos: paths
             .data_root
             .join("todos")
             .join(format!("{session_id}.json"))
             .is_file(),
-        tasks: paths
-            .data_root
-            .join("tasks")
-            .join(format!("{session_id}.json"))
-            .is_file(),
+        // 任务清单是**目录**：`tasks/<sessionId>/<taskId>.json`。
+        tasks: paths.data_root.join("tasks").join(session_id).is_dir(),
+        rollback: workspace_session.as_ref().is_some_and(|dir| {
+            dir.with_file_name(format!("{session_id}.file-rollback.ndjson"))
+                .is_file()
+        }),
         usage: usage_row_exists(paths, session_id),
     })
 }
@@ -190,7 +212,9 @@ pub fn backfill_group_context(
             .get("safeSourceMemberId")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .ok_or_else(|| format!("组 {group_id} 没有安全来源，无法回填"))?;
+            // 检查与补齐共用这条路径：文案不能只对「补齐」成立，否则用户点「检查」也会看到
+            // 「无法回填」，读起来像操作失败而不是「这个组没有可信来源」。
+            .ok_or_else(|| format!("组 {group_id} 没有可确认的安全来源，无法检查或补齐上下文"))?;
         let members = detail
             .get("members")
             .and_then(Value::as_array)
@@ -397,6 +421,7 @@ pub fn summarize(results: &[ContextIntegrity]) -> Value {
         "brokenSessions": broken,
         "missingReferences": missing,
         "withoutFileHistoryDir": results.iter().filter(|item| !item.file_history_dir).count(),
+        "withoutToolResults": results.iter().filter(|item| !item.tool_results).count(),
         "withoutUsage": results.iter().filter(|item| !item.usage).count(),
     })
 }
@@ -488,6 +513,14 @@ mod tests {
         env.write_body("s2", &[]);
         std::fs::create_dir_all(env.paths.data_root.join("todos")).unwrap();
         std::fs::write(env.paths.data_root.join("todos/s2.json"), b"{}").unwrap();
+        // 任务清单是目录：`tasks/<sid>/<taskId>.json`。
+        std::fs::create_dir_all(env.paths.data_root.join("tasks/s2")).unwrap();
+        std::fs::write(env.paths.data_root.join("tasks/s2/1.json"), b"{}").unwrap();
+        // 工具输出与回滚日志都挂在正文所在的工作区目录下。
+        let workspace = env.paths.projects_dir().join("ws-a");
+        std::fs::create_dir_all(workspace.join("s2/tool-results")).unwrap();
+        std::fs::write(workspace.join("s2/tool-results/call_1-render.txt"), b"{}").unwrap();
+        std::fs::write(workspace.join("s2.file-rollback.ndjson"), b"{}\n").unwrap();
         let conn = rusqlite::Connection::open(env.paths.workbuddy_db()).unwrap();
         conn.execute_batch(
             "CREATE TABLE session_usage (session_id TEXT PRIMARY KEY, used INTEGER, size INTEGER);
@@ -499,8 +532,21 @@ mod tests {
         let integrity = context_integrity(&env.paths, "s2").unwrap();
         assert_eq!(integrity.referenced, 0, "没有快照行就没有引用");
         assert!(integrity.todos);
-        assert!(!integrity.tasks);
+        assert!(integrity.tasks, "tasks/<sid>/ 是目录，必须按目录判定");
+        assert!(integrity.tool_results);
+        assert!(integrity.rollback);
         assert!(integrity.usage);
+    }
+
+    #[test]
+    fn integrity_reports_missing_tool_results_and_tasks() {
+        let env = TempEnv::new("integrity-absent");
+        env.write_body("s3", &[]);
+
+        let integrity = context_integrity(&env.paths, "s3").unwrap();
+        assert!(!integrity.tool_results, "没有目录就不该报存在");
+        assert!(!integrity.tasks);
+        assert!(!integrity.rollback);
     }
 
     #[test]

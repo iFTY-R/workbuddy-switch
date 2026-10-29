@@ -96,7 +96,7 @@ describe("SessionContextPanel", () => {
 
     // 请求必须带组 id 且明确是干跑（不带 apply）。
     expect(backfill).toHaveBeenCalledWith({ client: "workbuddy", groupIds: ["g-1"] });
-    expect(await screen.findByText("缺 3 个引用")).toBeTruthy();
+    expect(await screen.findByText("3 个引用失效")).toBeTruthy();
     expect(screen.getByText("备用账号")).toBeTruthy();
     expect(screen.getByRole("button", { name: /补齐上下文/ })).toBeTruthy();
   });
@@ -130,7 +130,9 @@ describe("SessionContextPanel", () => {
       referenced: 3,
       present: 1,
       missing: 2,
+      pruned: 0,
       missingSamples: ["h2@v1", "h3@v1"],
+      prunedSamples: [],
       fileHistoryDir: true,
       toolResults: false,
       todos: true,
@@ -144,7 +146,7 @@ describe("SessionContextPanel", () => {
     await userEvent.click(await screen.findByRole("button", { name: "备用账号 的上下文明细" }));
 
     expect(integrity).toHaveBeenCalledWith({ client: "workbuddy", sessionId: "s-2" });
-    expect(await screen.findByText("文件备份引用：1/3，悬空 2")).toBeTruthy();
+    expect(await screen.findByText("文件备份引用：1/3，失效 2")).toBeTruthy();
     expect(screen.getByText("工具输出缺失")).toBeTruthy();
     // 计划清单是存在的，不该被标成缺失。
     expect(screen.queryByText("计划清单缺失")).toBeNull();
@@ -152,7 +154,7 @@ describe("SessionContextPanel", () => {
 
     // 再点一次只收起，不重复请求。
     await userEvent.click(screen.getByRole("button", { name: "备用账号 的上下文明细" }));
-    expect(screen.queryByText("文件备份引用：1/3，悬空 2")).toBeNull();
+    expect(screen.queryByText("文件备份引用：1/3，失效 2")).toBeNull();
     expect(integrity).toHaveBeenCalledTimes(1);
   });
 

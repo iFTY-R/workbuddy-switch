@@ -1191,10 +1191,19 @@ export interface SessionContextIntegrity {
   referenced: number;
   /** 其中真实存在的数量。 */
   present: number;
-  /** 悬空引用数量，等于 `referenced - present`。 */
+  /** **真缺**的引用数：连这个文件的任何版本都不在。 */
   missing: number;
+  /**
+   * 已被同一文件的新版本取代的引用数。
+   *
+   * 备份是内容寻址的 `<hash>@vN`，客户端只保留较新版本；把这类算成「缺失」
+   * 会让完全正常的会话显示成缺上百个文件（真机实测某会话 199 个引用里 161 个如此）。
+   */
+  pruned: number;
   /** 缺失样例（最多 5 个）。 */
   missingSamples: string[];
+  /** 被取代的样例（最多 5 个）。 */
+  prunedSamples: string[];
   fileHistoryDir: boolean;
   /** 是否有 `tool-results/`：正文以绝对路径引用，缺了就断链。 */
   toolResults: boolean;

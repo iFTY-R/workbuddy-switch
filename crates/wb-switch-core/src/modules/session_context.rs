@@ -44,10 +44,18 @@ pub struct ContextIntegrity {
     pub referenced: usize,
     /// 其中在 `file-history/<sessionId>/` 下真实存在的数量。
     pub present: usize,
-    /// 悬空引用数量：等于 `referenced - present`。
+    /// **真缺**的引用数：连这个文件的任何版本都不在目录里。
     pub missing: usize,
+    /// 已被同一文件的新版本取代的引用数（`<hash>@v1` 不在、但 `<hash>@v9` 在）。
+    ///
+    /// 客户端对内容寻址的备份只保留较新版本，正文却会保留每一步的引用。把这类算成
+    /// 「缺失」会让一个完全正常的会话显示成缺上百个文件——真机实测某会话 199 个引用
+    /// 里 161 个属于这一类，而它只需要最近版本就能正常打开。
+    pub pruned: usize,
     /// 缺失样例（最多 5 个），便于人工核对。
     pub missing_samples: Vec<String>,
+    /// 被取代的样例（最多 5 个），用于确认「不是复制丢了，是客户端清理了旧版本」。
+    pub pruned_samples: Vec<String>,
     /// 是否已有 `file-history/<sessionId>/` 目录。
     pub file_history_dir: bool,
     /// 是否有 `projects/<workspace>/<sessionId>/tool-results/`（正文以绝对路径引用）。
@@ -87,11 +95,21 @@ pub fn context_integrity(
     let referenced = referenced_backups(&body)?;
 
     let history_dir = paths.data_root.join("file-history").join(session_id);
+    // 目录里已有哪些「文件哈希」：用来区分「这个文件彻底不在」与「只是这一版被清理」。
+    let present_hashes = hash_index(&history_dir);
     let mut present = 0;
+    let mut pruned = 0;
     let mut missing_samples = Vec::new();
+    let mut pruned_samples = Vec::new();
     for name in &referenced {
         if is_plain_file_name(name) && history_dir.join(name).is_file() {
             present += 1;
+        } else if is_plain_file_name(name) && present_hashes.contains(backup_hash(name)) {
+            // 同一文件还有别的版本在：客户端只保留较新版本，这一版属于正常清理。
+            pruned += 1;
+            if pruned_samples.len() < 5 {
+                pruned_samples.push(name.clone());
+            }
         } else if missing_samples.len() < 5 {
             missing_samples.push(name.clone());
         }
@@ -107,8 +125,13 @@ pub fn context_integrity(
         session_id: session_id.to_string(),
         referenced: referenced_count,
         present,
-        missing: referenced_count - present,
+        // `referenced = present + pruned + missing`：真缺的只有第三类。
+        missing: referenced_count
+            .saturating_sub(present)
+            .saturating_sub(pruned),
+        pruned,
         missing_samples,
+        pruned_samples,
         file_history_dir: history_dir.is_dir(),
         tool_results: workspace_session
             .as_ref()
@@ -128,8 +151,29 @@ pub fn context_integrity(
     })
 }
 
-/// 扫出正文里引用到的备份文件名（`trackedFileBackups[*].backupFileName`）。
+/// `file-history/<sessionId>/` 里已经存在的「文件哈希」集合。
 ///
+/// 备份文件名是内容寻址的 `<hash>@v<N>`：同一个文件的不同版本共享 `<hash>`，
+/// 客户端只保留较新的几版。有这份索引才能分清「这个文件彻底不在」与
+/// 「只是这一版被清理」——两者对用户的意义完全不同。
+fn hash_index(dir: &Path) -> BTreeSet<String> {
+    let mut set = BTreeSet::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return set;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        set.insert(backup_hash(&name).to_string());
+    }
+    set
+}
+
+/// `<hash>@v<N>` → `<hash>`；没有 `@` 时整名当哈希（保守：不会把别的文件认成同一份）。
+fn backup_hash(name: &str) -> &str {
+    name.split('@').next().unwrap_or(name)
+}
+
+/// 扫出正文里引用到的备份文件名（`trackedFileBackups[*].backupFileName`）。
 /// 按行解析：一行损坏只跳过该行，不让整次自检失败——自检的用途是给人看现场，
 /// 不是校验正文合法性（那是 `normalize_jsonl` 的职责）。
 fn referenced_backups(body: &Path) -> Result<BTreeSet<String>, String> {
@@ -478,12 +522,16 @@ pub fn scan_all(paths: &SessionPaths) -> Vec<ContextIntegrity> {
 
 /// 便于命令行打印的摘要。
 pub fn summarize(results: &[ContextIntegrity]) -> Value {
+    // `brokenSessions` 只数**真缺**的会话：被新版本取代的引用是客户端正常清理，
+    // 把它算进来会让「22/33 会话是坏的」这种假警报淹没真正需要处理的那几个。
     let broken = results.iter().filter(|item| item.missing > 0).count();
     let missing: usize = results.iter().map(|item| item.missing).sum();
+    let pruned: usize = results.iter().map(|item| item.pruned).sum();
     json!({
         "sessions": results.len(),
         "brokenSessions": broken,
         "missingReferences": missing,
+        "prunedReferences": pruned,
         "withoutFileHistoryDir": results.iter().filter(|item| !item.file_history_dir).count(),
         "withoutToolResults": results.iter().filter(|item| !item.tool_results).count(),
         "withoutUsage": results.iter().filter(|item| !item.usage).count(),
@@ -569,6 +617,29 @@ mod tests {
         assert_eq!(integrity.missing_samples, vec!["h2@v1".to_string()]);
         assert!(integrity.file_history_dir);
         assert!(!integrity.todos, "没有清单文件就该是 false");
+    }
+
+    #[test]
+    fn superseded_versions_count_as_pruned_not_missing() {
+        let env = TempEnv::new("integrity-pruned");
+        // 正文引用了同一文件的三代版本，目录里只剩最新那版——这是客户端的正常保留策略。
+        env.write_body(
+            "s4",
+            &[("a.txt", "h1@v1"), ("a.txt", "h1@v2"), ("a.txt", "h1@v9")],
+        );
+        env.write_backup("s4", "h1@v9");
+        // 另一个文件彻底不在，才算真缺。
+        env.write_body("s5", &[("b.txt", "h2@v1")]);
+
+        let integrity = context_integrity(&env.paths, "s4").unwrap();
+        assert_eq!(integrity.present, 1);
+        assert_eq!(integrity.pruned, 2, "同哈希的旧版本属于被取代");
+        assert_eq!(integrity.missing, 0, "整份文件还在，不该报缺失");
+        assert_eq!(integrity.pruned_samples.len(), 2);
+
+        let gone = context_integrity(&env.paths, "s5").unwrap();
+        assert_eq!(gone.pruned, 0);
+        assert_eq!(gone.missing, 1, "连任何版本都不在才是真缺");
     }
 
     #[test]

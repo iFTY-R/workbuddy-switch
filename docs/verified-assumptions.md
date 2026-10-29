@@ -77,6 +77,9 @@
 | `deleted_at` 本地删除用真实时间戳（1.7e12 量级），`-1` 是云端哨兵 | 本机 `sessions` 分布 |
 | 上下文旁路不止三处 | `file-history/<sid>/`、`todos/<sid>.json`、`tasks/<sid>/<taskId>.json`（目录！）、`projects/<ws>/<sid>/tool-results/`、`<sid>.file-rollback.ndjson`、`session_usage` 行 |
 | `tool-results` 在正文里是**绝对路径**引用，正文的会话 id 被整体替换后路径随之指向新 id | 单会话实测 143 处 |
+| **`file-history` 的备份会被客户端清理**：目录里只留同一文件的较新版本，正文却保留每一步的引用 | 实测 `47d0fc70` 正文引用 199 个、目录里只有 38 个；同哈希只见到 `@v9`，`@v1..@v8` 都不在 |
+| 因此「正文引用数 − 实存数」**不能直接当缺失数** | 修正后全量体检：missing 1896 → 1638，另 258 个属「被新版本取代」，broken 22 → 21 |
+| 有些会话**整份** `file-history/<id>/` 都不在（正文仍有上百个引用） | 33 个会话只有 11 个有备份目录，两个账号都是如此 → 是保留策略，不是复制丢了 |
 | 体积大到不该跟副本走的目录 | `workspace/sessions/`（6.2G）、`file-tree-manifests`（87M）、`changes-index` / `changes-detail`（40M）、`artifact-index` |
 
 ---
@@ -88,3 +91,16 @@
 3. **V6**：目标账号未装对应插件/专家时，打开带 `plugin_context_json` 的副本是否报缺 MCP。
 4. 批量操作的「关一次、开一次」是否真的成立（`docs/smoke-batch.md` 六步）。
 5. 记忆迁移后，目标账号的 `memory/<uid>_memory.md` 是否被客户端正常读取（而不是被判为「别人的记忆」后清空）。
+
+## 当前基线（2026-10-29，`session_doctor` 只读体检）
+
+```
+data root: C:\Users\Rostiute\.workbuddy
+sessions=33 broken=21 missingReferences=1638 prunedReferences=258
+withoutFileHistoryDir=22 withoutUsage=22
+```
+
+口径说明：`broken` 只数**真缺**（连任何版本都不在）的会话；`prunedReferences`
+是被同文件新版本取代的引用，属客户端正常清理。验收复制能力时用
+「**副本的 missing ⊆ 源的 missing**」，而不是「副本 missing == 0」——
+源会话自己就有上千条指向已清理文件的引用。

@@ -26,24 +26,26 @@ fn main() {
 
     let summary = session_context::summarize(&results);
     println!(
-        "sessions={} broken={} missingReferences={} withoutFileHistoryDir={} withoutUsage={}",
+        "sessions={} broken={} missingReferences={} prunedReferences={} withoutFileHistoryDir={} withoutUsage={}",
         summary["sessions"],
         summary["brokenSessions"],
         summary["missingReferences"],
+        summary["prunedReferences"],
         summary["withoutFileHistoryDir"],
         summary["withoutUsage"]
     );
 
     let mut broken: Vec<_> = results.iter().filter(|item| item.missing > 0).collect();
     broken.sort_by(|a, b| b.missing.cmp(&a.missing));
-    println!("\n-- 悬空引用最多的 10 个会话 --");
+    println!("\n-- 真缺引用最多的 10 个会话 --");
     for item in broken.iter().take(10) {
         println!(
-            "{}  referenced={} present={} missing={} dir={} todos={} tasks={} usage={}  e.g. {:?}",
+            "{}  referenced={} present={} missing={} pruned={} dir={} todos={} tasks={} usage={}  e.g. {:?}",
             item.session_id,
             item.referenced,
             item.present,
             item.missing,
+            item.pruned,
             item.file_history_dir,
             item.todos,
             item.tasks,

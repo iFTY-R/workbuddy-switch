@@ -161,7 +161,7 @@ export function SessionContextPanel({ client, groupId, variantScope, members, di
                   ? <Badge variant="outline" className="text-[10px]">无法自检</Badge>
                   : target.missing === 0
                     ? <Badge variant="success" className="text-[10px]">引用完整</Badge>
-                    : <Badge variant="warning" className="text-[10px]">缺 {target.missing} 个引用</Badge>}
+                    : <Badge variant="warning" className="text-[10px]">{target.missing} 个引用失效</Badge>}
               <Button variant="ghost" size="sm" className="h-5 px-1 text-[10px] text-muted-foreground" aria-label={`${nameOf(target.memberId)} 的上下文明细`} aria-expanded={open} disabled={detailBusy === target.memberId} onClick={() => void toggleDetail(target.memberId, target.sessionId)}>
                 {detailBusy === target.memberId ? <Loader2 className="size-3 animate-spin" /> : null}{open ? "收起" : "明细"}
               </Button>
@@ -169,7 +169,10 @@ export function SessionContextPanel({ client, groupId, variantScope, members, di
           </div>
           {warnings.length > 0 && <ul className="mt-1 space-y-0.5">{warnings.map((warning, index) => <li key={index} className="break-words text-[10px] leading-4 text-amber-700 dark:text-amber-300">{warning}</li>)}</ul>}
           {open && detail && <div className="mt-1.5 rounded-md bg-background/70 p-1.5">
-            <p className="text-[10px] text-muted-foreground">文件备份引用：{detail.present}/{detail.referenced}{detail.missing > 0 ? `，悬空 ${detail.missing}` : ""}</p>
+            <p className="text-[10px] text-muted-foreground">文件备份引用：{detail.present}/{detail.referenced}{detail.missing > 0 ? `，失效 ${detail.missing}` : ""}{detail.pruned > 0 ? `，${detail.pruned} 个已被新版本取代` : ""}</p>
+            {/* 目录整份不在、正文却有引用：多数是客户端按保留策略清理过，不是复制丢了。
+                不解释这一点，用户会以为功能坏了。 */}
+            {!detail.fileHistoryDir && detail.referenced > 0 && <p className="mt-0.5 break-words text-[10px] leading-4 text-muted-foreground">客户端已不再保留这个会话的备份目录（通常是清理旧版本），正文里的引用因此指向不存在的文件。</p>}
             <ul className="mt-1 grid grid-cols-2 gap-x-2 gap-y-0.5">
               {[
                 { label: "文件备份", ok: detail.fileHistoryDir },

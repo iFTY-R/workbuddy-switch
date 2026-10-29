@@ -1084,6 +1084,7 @@ fn run_copy(
                     cleanup_state,
                     cleanup_error,
                     normalized,
+                    sidecars,
                 }) => {
                     let mut item = json!({
                         "id": cid,
@@ -1099,12 +1100,20 @@ fn run_copy(
                     if !normalized.is_empty() {
                         item["normalized"] = json!(normalized);
                     }
+                    // 上下文关键：旁路数据（文件历史 / 计划清单）是否跟着搬过去了。
+                    if !sidecars.copied.is_empty() {
+                        item["sidecars"] = json!(sidecars.copied);
+                    }
+                    if !sidecars.warnings.is_empty() {
+                        item["sidecarWarnings"] = json!(sidecars.warnings);
+                    }
                     copied.push(item);
                 }
                 Ok(CopyOutcome::AlreadyLinked {
                     session_id,
                     group_id,
                     repaired,
+                    sidecars,
                 }) => {
                     let mut item = json!({
                         "id": cid,
@@ -1114,6 +1123,13 @@ fn run_copy(
                     // 旧版本写出的副本带着源账号的项目归属/运行态，重跑复制会在这里被修好。
                     if !repaired.is_empty() {
                         item["repaired"] = json!(repaired);
+                    }
+                    // 旧副本缺的旁路数据在重跑复制时补上了，这里要能看出来。
+                    if !sidecars.copied.is_empty() {
+                        item["sidecars"] = json!(sidecars.copied);
+                    }
+                    if !sidecars.warnings.is_empty() {
+                        item["sidecarWarnings"] = json!(sidecars.warnings);
                     }
                     already_linked.push(item);
                 }
@@ -1183,12 +1199,16 @@ enum CopyOutcome {
         cleanup_error: Option<String>,
         /// 本次归一改写的列名（空表示源行本可原样继承）。
         normalized: Vec<String>,
+        /// 一并搬运的旁路数据（文件历史 / 计划清单）。
+        sidecars: SidecarCopy,
     },
     AlreadyLinked {
         session_id: String,
         group_id: String,
         /// 对已有副本做的可见性修复（空表示无需修复）。
         repaired: Vec<String>,
+        /// 补搬的旁路数据：旧版本写出的副本缺这些目录，重跑复制时补上。
+        sidecars: SidecarCopy,
     },
 }
 
@@ -1312,6 +1332,127 @@ fn write_copy_body(
     }
 }
 
+/// 复制会话时一并搬运的旁路数据（正文之外、按会话 id 存放）。
+///
+/// 客户端打开一个会话，读的不只是 `projects/<workspace>/<cid>.jsonl`：
+/// - `file-history/<cid>/<hash>@vN` —— 每一步的文件备份。正文里
+///   `snapshot.trackedFileBackups[*].backupFileName` 存的是 `<hash>@vN`，
+///   而**目录名才是会话 id**，由客户端的 `PathMapper` 拼出来；
+/// - `todos/<cid>.json` / `tasks/<cid>.json` —— 计划与任务清单。
+///
+/// 只改正文里的 sessionId、不搬这三处，副本就会带着一堆指向不存在路径的引用：
+/// 会话内容看着还在，文件历史与计划上下文却全丢了——表现就是「关联成功、上下文不对」。
+#[derive(Debug, Default)]
+struct SidecarCopy {
+    /// 实际复制成功的种类（`fileHistory` / `todos` / `tasks`）。
+    copied: Vec<&'static str>,
+    /// 单项失败原因：旁路数据缺失不该让主复制失败，但必须如实上报。
+    warnings: Vec<String>,
+}
+
+/// 会话 id 能否安全地当作路径段：这些名字会拼进 `file-history/<id>/` 与
+/// `todos/<id>.json`，所以只允许字母数字与 `-`/`_`，且不得含分隔符或 `..`。
+fn is_session_id_like(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.contains('.')
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+}
+
+/// 把源会话的旁路数据复制到新会话 id 下（幂等：已存在的文件跳过）。
+fn copy_session_sidecars(
+    source_paths: &SessionPaths,
+    target_paths: &SessionPaths,
+    cid: &str,
+    new_cid: &str,
+) -> SidecarCopy {
+    let mut result = SidecarCopy::default();
+    if source_paths.data_root.as_os_str().is_empty()
+        || target_paths.data_root.as_os_str().is_empty()
+    {
+        // VS Code 命名空间不使用 data_root，也就没有这些目录。
+        return result;
+    }
+    if !is_session_id_like(cid) || !is_session_id_like(new_cid) {
+        result.warnings.push(format!(
+            "会话 id 形态异常（{cid} → {new_cid}），已跳过旁路数据复制"
+        ));
+        return result;
+    }
+
+    // 1) 文件历史：整目录搬到新会话 id 下。文件名是内容寻址的 `<hash>@vN`，
+    //    正文里的引用不用改。
+    let src_history = source_paths.data_root.join("file-history").join(cid);
+    if src_history.is_dir() {
+        let dst_history = target_paths.data_root.join("file-history").join(new_cid);
+        match copy_dir_additive(&src_history, &dst_history) {
+            Ok(files) if files > 0 => result.copied.push("fileHistory"),
+            Ok(_) => {}
+            Err(error) => result.warnings.push(format!(
+                "文件历史复制失败（{error}），副本将无法还原此前的文件状态"
+            )),
+        }
+    }
+
+    // 2) 计划 / 任务清单：单文件，内容里不含会话 id。
+    for (kind, dir) in [("todos", "todos"), ("tasks", "tasks")] {
+        let src = source_paths.data_root.join(dir).join(format!("{cid}.json"));
+        if !src.is_file() {
+            continue;
+        }
+        let dst = target_paths
+            .data_root
+            .join(dir)
+            .join(format!("{new_cid}.json"));
+        let copied = std::fs::read(&src)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| {
+                if let Some(parent) = dst.parent() {
+                    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+                }
+                session_backup::durable_write(&dst, &bytes).map_err(|error| error.to_string())
+            });
+        match copied {
+            Ok(()) => result.copied.push(kind),
+            Err(error) => result
+                .warnings
+                .push(format!("{kind} 复制失败（{error}），副本将缺少计划上下文")),
+        }
+    }
+    result
+}
+
+/// 追加式目录复制：只补目标缺失的文件；已存在即内容相同（文件名是内容哈希），跳过。
+///
+/// 因此恢复路径可以重复调用而不会把已复制的数据再写一遍。
+fn copy_dir_additive(src: &Path, dst: &Path) -> Result<usize, String> {
+    std::fs::create_dir_all(dst).map_err(|error| error.to_string())?;
+    let mut copied = 0;
+    for entry in std::fs::read_dir(src).map_err(|error| error.to_string())? {
+        let entry = entry.map_err(|error| error.to_string())?;
+        let path = entry.path();
+        let meta = std::fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+        let target = dst.join(entry.file_name());
+        if meta.file_type().is_symlink() {
+            // 不跟随链接：源目录里出现软链说明现场被改过，复制它等于把影响范围交出去。
+            return Err(format!("{} 是符号链接，已拒绝复制", path.display()));
+        }
+        if meta.is_dir() {
+            copied += copy_dir_additive(&path, &target)?;
+        } else if meta.is_file() {
+            if target.exists() {
+                continue;
+            }
+            let bytes = std::fs::read(&path).map_err(|error| error.to_string())?;
+            session_backup::durable_write(&target, &bytes).map_err(|error| error.to_string())?;
+            copied += 1;
+        }
+    }
+    Ok(copied)
+}
+
 /// 首次使用时先落地空的关联存储。
 ///
 /// 保证「操作日志出现」一定晚于「主文件存在」，否则刚预分配的操作日志会被
@@ -1381,10 +1522,18 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
                 source_project.as_deref(),
             )?
         };
+        // 旧版本写出的副本缺 `file-history/<cid>` 之类的旁路目录：重跑复制时补上，
+        // 让「已关联」的会话也能恢复完整的文件历史与计划上下文。
+        let sidecars = if session_id == cid {
+            SidecarCopy::default()
+        } else {
+            copy_session_sidecars(context.source_paths, paths, cid, &session_id)
+        };
         return Ok(CopyOutcome::AlreadyLinked {
             session_id,
             group_id: resolution.group_id.unwrap_or_default(),
             repaired,
+            sidecars,
         });
     }
 
@@ -1447,7 +1596,7 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
     };
     session_link::save_operation(paths, &operation)?;
 
-    let normalized = match finish_copy_from_body(
+    let (normalized, sidecars) = match finish_copy_from_body(
         paths,
         context.variant,
         context.source_paths,
@@ -1455,7 +1604,7 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
         &snapshot,
         Some(&source_path),
     ) {
-        Ok(normalized) => normalized,
+        Ok(result) => result,
         Err(error) => {
             fail_operation(paths, &mut operation, &error);
             return Err(error);
@@ -1476,6 +1625,7 @@ fn copy_one_session(context: &CopyContext, cid: &str) -> Result<CopyOutcome, Str
         cleanup_state: cleanup_state.to_string(),
         cleanup_error,
         normalized,
+        sidecars,
     })
 }
 
@@ -1557,7 +1707,7 @@ fn report_cleanup(
 /// （恢复场景），直接继续数据库行与关联。源行读取与目标行写入的档位经
 /// `source_paths` 分离（跨档复制时与 `paths` 不同，同档时相同）。
 ///
-/// 返回值为本轮**归一改写**的列名（源行可直接继承时为空）。恢复路径忽略该值：
+/// 返回值为本轮**归一改写**的列名（源行可直接继承时为空）与旁路数据复制结果。
 /// 归一只影响报告，不影响已提交的业务结果。
 fn finish_copy_from_body(
     paths: &SessionPaths,
@@ -1566,7 +1716,7 @@ fn finish_copy_from_body(
     operation: &mut Operation,
     snapshot: &ContentSnapshot,
     body_source: Option<&Path>,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, SidecarCopy), String> {
     if let Some(source_path) = body_source {
         write_copy_body(
             snapshot,
@@ -1578,6 +1728,14 @@ fn finish_copy_from_body(
         )?;
         advance_operation(paths, operation, OpPhase::BodyWritten)?;
     }
+
+    // 旁路数据先于数据库行落盘：行一出现，客户端就可能立刻打开它并读取这些目录。
+    let sidecars = copy_session_sidecars(
+        source_paths,
+        paths,
+        &operation.source.session_id,
+        &operation.target.session_id,
+    );
 
     let normalized = match insert_session_copy(
         source_paths,
@@ -1606,7 +1764,7 @@ fn finish_copy_from_body(
     operation.group_id = group_id;
     advance_operation(paths, operation, OpPhase::LinksCommitted)?;
     advance_operation(paths, operation, OpPhase::Completed)?;
-    Ok(normalized)
+    Ok((normalized, sidecars))
 }
 
 /// 推进操作阶段。阶段只能前进：已经走到更靠后的阶段时不回写（恢复路径不得把
@@ -4498,6 +4656,14 @@ fn recover_copy_operation(
             source.normalized
         }
     };
+
+    // 旁路数据（文件历史 / 计划清单）缺了就补：恢复路径同样要保证副本上下文完整。
+    let _ = copy_session_sidecars(
+        read_paths,
+        paths,
+        &operation.source.session_id,
+        &operation.target.session_id,
+    );
 
     // 2) 数据库行：缺失则补写，归属异常则停止。
     match session_row_owner(paths, &operation.target.session_id) {

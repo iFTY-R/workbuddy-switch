@@ -6165,3 +6165,118 @@ fn sync_recovery_stops_without_usable_backup() {
     );
     assert_eq!(body_bytes(&env, &target_id), target_before);
 }
+
+// ── 旁路数据：上下文来自哪里 ──────────────────────────────────────────
+
+#[test]
+fn copy_carries_file_history_and_todos_to_new_session_id() {
+    let env = ready_env("sidecars");
+    let history = env.paths.data_root.join("file-history").join("sess-1");
+    std::fs::create_dir_all(&history).unwrap();
+    std::fs::write(history.join("abc123@v1"), b"old file bytes").unwrap();
+    let todos = env.paths.data_root.join("todos").join("sess-1.json");
+    std::fs::create_dir_all(todos.parent().unwrap()).unwrap();
+    std::fs::write(&todos, br#"{"todos":[{"id":"t1","status":"pending"}]}"#).unwrap();
+    let tasks = env.paths.data_root.join("tasks").join("sess-1.json");
+    std::fs::create_dir_all(tasks.parent().unwrap()).unwrap();
+    std::fs::write(&tasks, br#"{"tasks":[]}"#).unwrap();
+
+    let report = copy(&env, "uid-b", &["sess-1"]);
+    let new_id = env.first_copy_id(&report);
+
+    // 客户端按 `file-history/<sessionId>/<backupFileName>` 取文件备份：目录名换成新 id
+    // 且文件内容一致，正文里那些 `trackedFileBackups` 引用才不是悬空的。
+    let copied_history = env
+        .paths
+        .data_root
+        .join("file-history")
+        .join(&new_id)
+        .join("abc123@v1");
+    assert_eq!(
+        std::fs::read(&copied_history).unwrap(),
+        b"old file bytes",
+        "文件备份必须跟到新会话 id 下"
+    );
+    assert_eq!(
+        std::fs::read_to_string(
+            env.paths
+                .data_root
+                .join("todos")
+                .join(format!("{new_id}.json"))
+        )
+        .unwrap(),
+        r#"{"todos":[{"id":"t1","status":"pending"}]}"#,
+        "计划清单要跟着搬"
+    );
+    assert!(env
+        .paths
+        .data_root
+        .join("tasks")
+        .join(format!("{new_id}.json"))
+        .is_file());
+
+    let sidecars: Vec<&str> = report["copied"][0]["sidecars"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(sidecars.contains(&"fileHistory"), "{report}");
+    assert!(sidecars.contains(&"todos"), "{report}");
+    assert!(sidecars.contains(&"tasks"), "{report}");
+    assert!(
+        report["copied"][0]["sidecarWarnings"].is_null(),
+        "没有失败就不该报警告：{report}"
+    );
+}
+
+#[test]
+fn copy_without_sidecars_stays_quiet() {
+    let env = ready_env("no-sidecars");
+    let report = copy(&env, "uid-b", &["sess-1"]);
+    assert!(report["copied"][0]["sidecars"].is_null(), "{report}");
+    assert!(report["copied"][0]["sidecarWarnings"].is_null(), "{report}");
+}
+
+#[test]
+fn already_linked_copy_backfills_missing_sidecars() {
+    let env = ready_env("backfill");
+    let history = env.paths.data_root.join("file-history").join("sess-1");
+    std::fs::create_dir_all(&history).unwrap();
+    std::fs::write(history.join("abc123@v1"), b"bytes").unwrap();
+
+    let first = copy(&env, "uid-b", &["sess-1"]);
+    let new_id = env.first_copy_id(&first);
+    let copied_dir = env.paths.data_root.join("file-history").join(&new_id);
+    assert!(copied_dir.is_dir());
+    // 模拟旧版本写出的副本：正文与数据库行都在，旁路目录却缺。
+    std::fs::remove_dir_all(&copied_dir).unwrap();
+
+    let second = copy(&env, "uid-b", &["sess-1"]);
+    assert_eq!(
+        second["alreadyLinked"].as_array().unwrap().len(),
+        1,
+        "{second}"
+    );
+    assert!(
+        copied_dir.join("abc123@v1").is_file(),
+        "重跑复制要把缺的旁路数据补上：{second}"
+    );
+    let sidecars: Vec<&str> = second["alreadyLinked"][0]["sidecars"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(sidecars.contains(&"fileHistory"), "{second}");
+}
+
+#[test]
+fn session_id_guard_rejects_path_segments() {
+    assert!(is_session_id_like("sess-1"));
+    assert!(is_session_id_like("2f1b9c4e-1a2b-4c3d-8e9f-0a1b2c3d4e5f"));
+    assert!(!is_session_id_like("..\\..\\etc"));
+    assert!(!is_session_id_like("../x"));
+    assert!(!is_session_id_like("a/b"));
+    assert!(!is_session_id_like(""));
+}

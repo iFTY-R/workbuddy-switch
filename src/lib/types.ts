@@ -1179,6 +1179,13 @@ export interface SessionBatchJob {
     reopenErrors: string[];
   };
   items: SessionBatchItem[];
+  /**
+   * 补副本的目标账号（随报告落盘）。
+   *
+   * 重试要以它为准：弹窗关掉、进程重启、从历史报告进入时，界面上的勾选已经没了，
+   * 但「上次补到哪些账号」必须能还原，否则重试会因为空选择被后端拒绝。
+   */
+  targetAccountIds?: string[];
 }
 
 /** 批量操作的一个目标：key 用于回填选择态，groupId 用于执行。 */

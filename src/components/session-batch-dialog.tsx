@@ -76,7 +76,11 @@ export function SessionBatchDialog({
   /** 开始执行；补副本要把选中的目标账号一起带上（后端拒绝空选择）。 */
   onStart: (targetAccountIds?: string[]) => void;
   onCancelRun: () => void;
-  onRetryFailed: (targets: SessionBatchTarget[]) => void;
+  /**
+   * 重试失败项。补副本必须把**同一次选择的目标账号**带上：
+   * 后端拒绝空目标（不选 ≠ 全选），漏传会让「重试」直接报错。
+   */
+  onRetryFailed: (targets: SessionBatchTarget[], targetAccountIds?: string[]) => void;
   /** 导出本次报告（CSV）；不传则不显示导出按钮。 */
   onExport?: (job: SessionBatchJob) => void;
   onDone: () => void;
@@ -330,7 +334,23 @@ export function SessionBatchDialog({
                   <Button variant="ghost" onClick={() => onExport(job)}>导出报告</Button>
                 )}
                 {retry.length > 0 && (
-                  <Button variant="outline" onClick={() => onRetryFailed(retry)}>重试 {retry.length} 项</Button>
+                  <Button
+                    variant="outline"
+                    onClick={() =>
+                      onRetryFailed(
+                        retry,
+                        // 优先用界面上当前的勾选；没有就以报告里落盘的目标账号为准
+                        // （弹窗重开 / 从历史报告进入时界面状态已丢）。
+                        op === "copy"
+                          ? targets.size > 0
+                            ? [...targets]
+                            : job?.targetAccountIds ?? []
+                          : undefined,
+                      )
+                    }
+                  >
+                    重试 {retry.length} 项
+                  </Button>
                 )}
                 <Button onClick={onDone}>完成</Button>
               </>

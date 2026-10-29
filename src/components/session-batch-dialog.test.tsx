@@ -137,7 +137,7 @@ describe("SessionBatchDialog", () => {
     const callbacks = renderDialog({ job: finished });
     expect(screen.getByText(/完成 1 · 跳过 1 · 失败 1/)).toBeTruthy();
     await userEvent.click(screen.getByRole("button", { name: "重试 1 项" }));
-    expect(callbacks.onRetryFailed).toHaveBeenCalledWith([{ key: "k2", groupId: "g-k2" }]);
+    expect(callbacks.onRetryFailed).toHaveBeenCalledWith([{ key: "k2", groupId: "g-k2" }], undefined);
   });
 
   it("中止原因原样展示，不吞成「失败 0 项」", () => {
@@ -229,5 +229,35 @@ describe("SessionBatchDialog 补副本", () => {
     getAccounts.mockRejectedValueOnce(new Error("账号库读取失败"));
     renderDialog({ op: "copy" });
     expect((await screen.findByRole("alert")).textContent).toContain("账号库读取失败");
+  });
+});
+
+describe("SessionBatchDialog 补副本重试", () => {
+  it("重试要把同一批目标账号带上，否则后端会因空选择拒绝", async () => {
+    const finished: SessionBatchJob = {
+      jobId: "job-copy",
+      client: "workbuddy",
+      op: "copy",
+      state: "finished",
+      total: 2,
+      done: 1,
+      current: null,
+      aborted: null,
+      cancelled: false,
+      startedAt: 1,
+      finishedAt: 2,
+      targetAccountIds: ["acc-1"],
+      items: [
+        { key: "k1", groupId: "g-k1", title: "会话一", status: "done", synced: 1, affected: 1, planned: 1 },
+        { key: "k2", groupId: "g-k2", title: "会话二", status: "failed", message: "写入失败", synced: 0, affected: 0, planned: 1 },
+      ],
+    };
+    const callbacks = renderDialog({ op: "copy", job: finished });
+
+    // 结果态看不到账号勾选（计划区已收起）：重试必须以报告里落盘的目标账号为准，
+    // 否则「弹窗重开后再重试」会因为空选择被后端拒绝。
+    await userEvent.click(screen.getByRole("button", { name: "重试 1 项" }));
+
+    expect(callbacks.onRetryFailed).toHaveBeenCalledWith([{ key: "k2", groupId: "g-k2" }], ["acc-1"]);
   });
 });

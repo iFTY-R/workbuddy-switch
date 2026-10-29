@@ -809,11 +809,12 @@ export default function SessionsPage() {
         onStart={(targetAccountIds) => void startBatch(batchOp, selectedTargets(groups, selectedKeys), allowBatchRestart, targetAccountIds)}
         onCancelRun={() => void batch.cancel()}
         onExport={(job) => void exportBatchReport(job)}
-        onRetryFailed={(targets) => {
+        onRetryFailed={(targets, targetAccountIds) => {
           // 重试只提交失败/未执行的项：选择集同步收窄，否则计划弹窗显示的是旧的全选数量。
           setSelectedKeys(new Set(targets.map((target) => target.key)));
           batch.reset();
-          void startBatch(batchOp, targets, allowBatchRestart);
+          // 补副本重试必须沿用同一批目标账号，否则后端会因为「没选账号」直接拒绝。
+          void startBatch(batchOp, targets, allowBatchRestart, targetAccountIds);
         }}
         onDone={() => { setBatchOpen(false); clearBatchSelection(); void reloadGroups(); }}
       />

@@ -146,6 +146,8 @@ fn finished_job_snapshot_reports_counts_and_items() {
     assert_eq!(snapshot["lifecycle"]["closed"][0], "WorkBuddy 国内版");
     assert_eq!(snapshot["items"][0]["status"], "done");
     assert_eq!(snapshot["items"][0]["synced"], 3);
+    // 目标账号要进报告：重试以报告为准，界面上的勾选随时会丢。
+    assert_eq!(snapshot["targetAccountIds"], json!([]));
     // 未结束的 job 不能被当成 finished 参与内存清理。
     assert!(!job.is_finished());
     job.state = "finished".to_string();

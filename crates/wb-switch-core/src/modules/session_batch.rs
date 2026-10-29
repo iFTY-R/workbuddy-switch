@@ -204,6 +204,9 @@ impl BatchJob {
                 "keptClosed": self.kept_closed,
                 "reopenErrors": self.reopen_errors,
             },
+            // 补副本的目标账号随报告落盘：重试时要以报告为准，而不是依赖界面上
+            // 还留着的勾选（弹窗关掉、进程重启、从历史报告进入都会丢）。
+            "targetAccountIds": self.target_account_ids,
             "items": self.items,
         })
     }

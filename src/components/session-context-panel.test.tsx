@@ -57,6 +57,13 @@ function dryRun(missing: number): SessionContextBackfillReport {
     groups: [{ groupId: "g-1", sourceSessionId: "s-1", targets: [{ memberId: "m2", sessionId: "s-2", missing }] }],
     copiedSidecars: 0,
     warnings: [],
+    notCarried: {
+      count: 2,
+      items: [
+        { name: "workspace/sessions", reason: "工作区快照，实测单机 6.2G；打开会话时按需重建" },
+        { name: "artifact-index", reason: "产物索引；按需重新生成" },
+      ],
+    },
   };
 }
 
@@ -171,5 +178,35 @@ describe("SessionContextPanel", () => {
     expect(gc).toHaveBeenCalledWith({ client: "workbuddy" });
     expect(await screen.findByText(/发现 1 个可回收/)).toBeTruthy();
     expect(screen.getByRole("button", { name: /删除 1 个/ })).toBeTruthy();
+  });
+
+  it("检查后说清「没补什么」，清单来自后端而不是前端自写", async () => {
+    backfill.mockResolvedValueOnce(dryRun(1));
+    renderPanel();
+
+    await userEvent.click(screen.getByRole("button", { name: /检查上下文/ }));
+    // 折叠标题先给出条目数，展开后才逐项列出——「补了什么」旁边必须有「没补什么」。
+    await userEvent.click(await screen.findByRole("button", { name: /不会搬运的内容（2 类）/ }));
+
+    expect(await screen.findByText(/打开会话时按需重建/)).toBeTruthy();
+    expect(screen.getByText(/按需重新生成/)).toBeTruthy();
+  });
+
+  it("干跑时显示上次真实清理的时间，删除后不重复展示", async () => {
+    const at = Date.UTC(2026, 9, 20, 3, 0, 0);
+    gc.mockResolvedValueOnce({
+      scanned: 0,
+      orphans: [],
+      removed: 0,
+      applied: false,
+      lastRun: { at, removed: 3, sessionIds: ["a", "b", "c"] },
+    });
+    renderPanel();
+
+    await userEvent.click(screen.getByRole("button", { name: /维护：清理无主文件历史/ }));
+    await userEvent.click(screen.getByRole("button", { name: /扫描候选/ }));
+
+    // 删除不可逆：干跑时也要能看到「上次删了几个」，否则用户不知道现在这堆候选从哪来。
+    expect(await screen.findByText(/上次清理：.*删除 3 个目录/)).toBeTruthy();
   });
 });

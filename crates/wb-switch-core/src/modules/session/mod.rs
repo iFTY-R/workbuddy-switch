@@ -1461,6 +1461,36 @@ fn session_workspace_dirs(
     ))
 }
 
+/// 复制 / 同步**不会**搬运的会话维度数据，以及不搬的理由。
+///
+/// 这份清单是界面的唯一来源：面板上「不会搬运的内容」直接读它，不另写一份文案。
+/// 与 [`copy_session_sidecars`] 的白名单互为补集——那边搬什么，这边就列剩下的什么，
+/// 所以新增一类旁路数据时只会改一处，不会出现「已经搬了却还告诉用户没搬」。
+///
+/// 判据是「缺了能不能正常打开会话」：这四类都是可以按需重建的索引/快照，
+/// 体积却远大于正文本身（真机实测合计 6G 量级），默认搬会把复制变成分钟级操作。
+pub const NOT_CARRIED: &[(&str, &str)] = &[
+    (
+        "workspace/sessions",
+        "工作区快照，实测单机 6.2G；打开会话时按需重建",
+    ),
+    ("file-tree-manifests", "文件树清单，实测 87M；按需重新扫描"),
+    (
+        "changes-index / changes-detail",
+        "变更索引与详情，实测 40M；可由正文重建",
+    ),
+    ("artifact-index", "产物索引；按需重新生成"),
+];
+
+/// 把 [`NOT_CARRIED`] 渲染成界面用的结构（含条目数，便于前端决定是否折叠）。
+pub fn not_carried_report() -> Value {
+    let items: Vec<Value> = NOT_CARRIED
+        .iter()
+        .map(|(name, reason)| json!({"name": name, "reason": reason}))
+        .collect();
+    json!({"items": items, "count": items.len()})
+}
+
 /// 把源会话的旁路数据复制到新会话 id 下（幂等：已存在的文件跳过）。
 pub(crate) fn copy_session_sidecars(
     source_paths: &SessionPaths,

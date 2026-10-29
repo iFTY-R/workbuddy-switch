@@ -17,13 +17,15 @@
 //! 明确不在自检范围内（体积与用途都不适合跟着副本走，缺了不影响会话打开）：
 //! `workspace/sessions/<sessionId>/`（文件快照，实测可达数 GB）、
 //! `file-tree-manifests/`、`changes-index|changes-detail/`、`artifact-index/`。
+//! 这份清单只写在 [`session::NOT_CARRIED`] 一处，界面文案由它驱动。
 
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::modules::config;
 use crate::modules::session::{self, SessionPaths};
 use crate::modules::session_groups::{self, SessionClient};
 use crate::modules::session_link::{self, StoreState};
@@ -284,6 +286,9 @@ pub fn backfill_group_context(
         "groups": groups,
         "copiedSidecars": copied_total,
         "warnings": warnings,
+        // 「补了什么」之外还要说「没补什么」：不搬的那几类体积是正文的几十倍，
+        // 用户看到「已补齐」却翻不到变更记录时会以为功能坏了。
+        "notCarried": session::not_carried_report(),
     }))
 }
 
@@ -301,7 +306,66 @@ fn member_variant(member: &Value) -> WbVariant {
 /// 数据库行或关联成员引用它、最后修改时间早于 [`ORPHAN_GRACE_MS`]。
 /// `apply = false` 时只列出候选。
 pub fn gc_orphan_sidecars(paths: &SessionPaths, apply: bool) -> Value {
-    gc_orphan_sidecars_at(paths, apply, crate::modules::config::now_ms())
+    let mut report = gc_orphan_sidecars_at(paths, apply, config::now_ms());
+    // 只有真删了东西才留痕：干跑不写日志，否则「上次清理」会被一堆空跑刷掉。
+    if apply && report.get("removed").and_then(Value::as_u64).unwrap_or(0) > 0 {
+        if let Some(entry) = append_gc_audit(paths, &report) {
+            report["audit"] = entry;
+        }
+    }
+    // 上次清理一并带上：GC 是不可逆操作，用户下次打开面板要能看到「上次删了什么」。
+    report["lastRun"] = last_gc_audit(paths).unwrap_or(Value::Null);
+    report
+}
+
+/// GC 留痕文件：与其它备份同处 `~/.wb-switch/backups/`，按档位分开。
+fn gc_audit_path(paths: &SessionPaths) -> PathBuf {
+    paths.backup_root().join("gc-audit.jsonl")
+}
+
+/// 追加一条清理记录，返回写进去的那条（写失败返回 `None`，不影响回收本身）。
+fn append_gc_audit(paths: &SessionPaths, report: &Value) -> Option<Value> {
+    let removed: Vec<&str> = report
+        .get("orphans")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter(|item| {
+            item.get("removed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .filter_map(|item| item.get("sessionId").and_then(Value::as_str))
+        .collect();
+    if removed.is_empty() {
+        return None;
+    }
+    let entry = json!({
+        "at": config::now_ms(),
+        "removed": removed.len(),
+        "sessionIds": removed,
+    });
+    let path = gc_audit_path(paths);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    // 追加写而不是整篇重写：日志是旁证，坏一行不该让「已经删掉的目录」变成失败。
+    let line = format!("{entry}\n");
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .ok()?;
+    use std::io::Write;
+    file.write_all(line.as_bytes()).ok()?;
+    Some(entry)
+}
+
+/// 最后一条清理记录；没有日志或末行损坏时返回 `None`。
+fn last_gc_audit(paths: &SessionPaths) -> Option<Value> {
+    let text = std::fs::read_to_string(gc_audit_path(paths)).ok()?;
+    text.lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<Value>(line).ok())
 }
 
 /// [`gc_orphan_sidecars`] 的可注入实现：`now` 由调用方给，测试才能覆盖「超过宽限期」，
@@ -580,6 +644,46 @@ mod tests {
         let report = gc_orphan_sidecars_at(&env.paths, true, crate::modules::config::now_ms());
         assert_eq!(report["removed"], 0, "{report}");
         assert!(env.paths.data_root.join("file-history/fresh").is_dir());
+    }
+
+    #[test]
+    fn gc_audit_records_only_actual_removals() {
+        let env = TempEnv::new("gc-audit");
+
+        // 干跑（或没删成）不留痕：否则「上次清理」会被一堆空跑刷掉。
+        let dry = json!({"orphans": [{"sessionId": "a", "removed": false}], "removed": 0});
+        assert!(append_gc_audit(&env.paths, &dry).is_none());
+        assert!(last_gc_audit(&env.paths).is_none(), "没删东西就不该有日志");
+
+        let applied = json!({
+            "orphans": [
+                {"sessionId": "a", "removed": true},
+                {"sessionId": "b", "removed": false},
+            ],
+            "removed": 1,
+        });
+        let entry = append_gc_audit(&env.paths, &applied).expect("删了就要留痕");
+        assert_eq!(entry["removed"], 1);
+        assert_eq!(entry["sessionIds"], json!(["a"]), "只记真正删掉的");
+        assert_eq!(
+            last_gc_audit(&env.paths).unwrap()["sessionIds"],
+            json!(["a"])
+        );
+    }
+
+    #[test]
+    fn not_carried_list_stays_in_sync_with_count() {
+        let report = session::not_carried_report();
+        assert_eq!(
+            report["count"].as_u64().unwrap() as usize,
+            session::NOT_CARRIED.len(),
+            "count 必须由同一份清单算出"
+        );
+        for item in report["items"].as_array().unwrap() {
+            assert!(!item["name"].as_str().unwrap_or_default().is_empty());
+            // 每一项都要有「为什么不搬」：只说「不搬」而不说理由，用户没法判断影响。
+            assert!(!item["reason"].as_str().unwrap_or_default().is_empty());
+        }
     }
 
     #[test]

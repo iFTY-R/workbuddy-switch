@@ -36,6 +36,12 @@ function sidecarText(kinds: string[]): string {
   return kinds.map((kind) => sidecarLabels[kind] ?? kind).join("、");
 }
 
+/** 留痕时间：解析不出来就说「时间未知」，不显示 `NaN`。 */
+function formatWhen(ms: number): string {
+  const date = new Date(ms);
+  return Number.isNaN(date.getTime()) ? "时间未知" : date.toLocaleString();
+}
+
 /**
  * 会话上下文完整性面板（组维度）。
  *
@@ -184,6 +190,22 @@ export function SessionContextPanel({ client, groupId, variantScope, members, di
       {report.applied && <p className="flex items-center gap-1 text-[11px] leading-4 text-muted-foreground"><Check className="size-3 shrink-0 text-brand" />本次共补 {report.copiedSidecars} 个条目；重复执行不会写第二份。</p>}
       {!report.applied && missingTotal > 0 && <p className="text-[11px] leading-4 text-muted-foreground">补齐以组内可验证的安全来源为源，只补目标缺的文件，不覆盖已有内容。</p>}
       {report.warnings.length > 0 && <ul className="space-y-0.5">{report.warnings.map((warning, index) => <li key={index} className="break-words text-[10px] leading-4 text-amber-700 dark:text-amber-300">{warning}</li>)}</ul>}
+      {/* 「补了什么」之外必须说清「没补什么」：不搬的那几类体积是正文的几十倍，
+          用户翻不到变更记录时会以为补齐没生效。清单由后端 NOT_CARRIED 单一来源驱动。 */}
+      {report.notCarried && report.notCarried.count > 0 && <Collapsible>
+        <CollapsibleTrigger asChild>
+          <Button variant="ghost" size="sm" className="h-5 gap-1 px-0 text-[10px] text-muted-foreground hover:bg-transparent hover:text-foreground">
+            <Info className="size-2.5" />不会搬运的内容（{report.notCarried.count} 类）
+          </Button>
+        </CollapsibleTrigger>
+        <CollapsibleContent className="pt-1">
+          <ul className="space-y-0.5">
+            {report.notCarried.items.map((item) => <li key={item.name} className="break-words text-[10px] leading-4 text-muted-foreground">
+              <span className="font-medium text-foreground/80">{item.name}</span>：{item.reason}
+            </li>)}
+          </ul>
+        </CollapsibleContent>
+      </Collapsible>}
     </div>}
 
     <Collapsible className="mt-2">
@@ -200,6 +222,10 @@ export function SessionContextPanel({ client, groupId, variantScope, members, di
         </div>
         {gcReport && <p className="text-[10px] leading-4 text-muted-foreground">
           {gcReport.applied ? `已删除 ${gcReport.removed} 个目录。` : gcReport.orphans.length === 0 ? "没有可回收的目录。" : `扫描 ${gcReport.scanned} 个目录，发现 ${gcReport.orphans.length} 个可回收：${gcReport.orphans.slice(0, 3).map((orphan) => `${orphan.sessionId.slice(0, 8)}…（${orphan.ageDays} 天）`).join("、")}${gcReport.orphans.length > 3 ? " 等" : ""}`}
+        </p>}
+        {/* 上次清理：删除不可逆，干跑时把「上次真删了什么」摆出来，用户才知道现在看到的是哪一次的结果。 */}
+        {gcReport && !gcReport.applied && gcReport.lastRun && <p className="text-[10px] leading-4 text-muted-foreground">
+          上次清理：{formatWhen(gcReport.lastRun.at)}，删除 {gcReport.lastRun.removed} 个目录。
         </p>}
       </CollapsibleContent>
     </Collapsible>

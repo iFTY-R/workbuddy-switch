@@ -1227,6 +1227,14 @@ export interface SessionContextBackfillReport {
   groups: SessionContextBackfillGroup[];
   copiedSidecars: number;
   warnings: string[];
+  /** 明确**不**搬运的会话数据：由后端 `session::NOT_CARRIED` 单一来源驱动。 */
+  notCarried?: SessionContextNotCarried;
+}
+
+/** 「补了什么」之外必须说清「没补什么」，否则用户会以为功能坏了。 */
+export interface SessionContextNotCarried {
+  count: number;
+  items: { name: string; reason: string }[];
 }
 
 export interface SessionContextGcOrphan {
@@ -1243,4 +1251,15 @@ export interface SessionContextGcReport {
   removed: number;
   /** false 为干跑：只列候选，不动磁盘。 */
   applied: boolean;
+  /** 本次真正删除时写入的留痕条目；干跑或没删成时为 `undefined`。 */
+  audit?: SessionContextGcAudit;
+  /** 上一次真正执行清理的记录；从未清理过为 `null`。 */
+  lastRun?: SessionContextGcAudit | null;
+}
+
+/** GC 留痕：删除不可逆，所以每次真删都留一条。 */
+export interface SessionContextGcAudit {
+  at: number;
+  removed: number;
+  sessionIds: string[];
 }

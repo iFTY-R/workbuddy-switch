@@ -540,6 +540,10 @@ fn links_preview_in_filtered(
         "targetUid": target_uid,
         "groups": [],
     });
+    // 读取之前先自愈两侧被中断的覆盖：否则目标会话会以「内容缺失」出现在预览里，
+    // 用户既看不出原因，也没有重试入口（详见 `recover_interrupted_overwrites`）。
+    recover_interrupted_overwrites(spec, root, source_uid);
+    recover_interrupted_overwrites(spec, root, &target_uid);
     match session_link::load_store(paths) {
         StoreState::Missing => report["storeStatus"] = json!("missing"),
         StoreState::Unavailable(reason) => {
@@ -1001,6 +1005,8 @@ fn plan_sync_item(
         return skip("找不到会话所在的工作区，检查结果已失效".to_string());
     };
     // 重新加载正文、基线与判定，再与凭据逐项核对；任一变化都跳过（含显式覆盖）。
+    // 目标目录可能停在上次覆盖的「已退役未就位」状态：先自愈，再按真实内容判定。
+    recover_retired_target(&target_dir);
     let source_content =
         vscode_session_link::read_session_content(&source_dir, &source_member.session_id);
     let target_content =
@@ -1511,10 +1517,12 @@ fn overwrite(paths: &SessionPaths, plan: &SyncItemPlan) -> Result<Value, String>
     }
     // 让旧目录「退役」再让新目录就位：两次都是同卷 rename。即便进程在两次之间被杀，
     // 旧内容仍完整躺在 `.old-<id>` 下（可自动复原），而不是被 remove_dir_all 直接删掉。
-    let retired_dir = plan.target_dir.with_file_name(format!(
-        ".old-{}{OVERWRITE_SUFFIX}",
-        plan.target_conversation_id
-    ));
+    // 路径必须由 [`retired_dir`] 统一计算——写和读各拼一遍字符串，就会「写到这里、
+    // 去那里找」，自愈形同虚设。
+    let Some(retired_dir) = retired_dir(&plan.target_dir) else {
+        vscode_session::remove_dir_all_if_exists(&tmp_dir);
+        return Err("目标会话目录名异常，已停止覆盖".to_string());
+    };
     vscode_session::remove_dir_all_if_exists(&retired_dir);
     let retired = plan.target_dir.exists();
     if retired {
@@ -1577,23 +1585,86 @@ fn overwrite(paths: &SessionPaths, plan: &SyncItemPlan) -> Result<Value, String>
     }))
 }
 
-/// 还原被中断的覆盖：目标目录缺失、而同级存在 `.old-<目标目录名>` 时改回原名。
+/// 退役目录的全部候选名：`.old-<目标目录名>`（本版）与
+/// `.old-<目标目录名>-overwrite`（0.1.62.x 写出的名字）。
 ///
-/// 只在「目标不存在」时动手——目标还在就说明上次已完成就位，`.old-` 只是待清理残留，
-/// 不能拿旧内容覆盖新内容。
+/// 旧名字必须认识：升级前被打断的用户，盘上留的正是后者，认不出来就等于把他们的
+/// 会话永久锁在「目标目录缺失」状态。
+fn retired_candidates(target_dir: &Path) -> Vec<PathBuf> {
+    let Some(name) = target_dir.file_name().and_then(|value| value.to_str()) else {
+        return Vec::new();
+    };
+    vec![
+        target_dir.with_file_name(format!(".old-{name}")),
+        target_dir.with_file_name(format!(".old-{name}{OVERWRITE_SUFFIX}")),
+    ]
+}
+
+/// 本版写盘用的退役目录名（候选里的第一个）。
+///
+/// [`recover_retired_target`] 用的是同一份候选表，两处因此不会错位。
+fn retired_dir(target_dir: &Path) -> Option<PathBuf> {
+    retired_candidates(target_dir).into_iter().next()
+}
+
+/// 还原被中断的覆盖：目标目录缺失、而同级存在退役目录时改回原名。
+///
+/// 只在「目标不存在」时动手——目标还在就说明上次已完成就位，退役目录只是待清理
+/// 残留，不能拿旧内容覆盖新内容。
 fn recover_retired_target(target_dir: &Path) {
     if target_dir.exists() {
         return;
     }
-    let (Some(name), Some(parent)) = (
-        target_dir.file_name().and_then(|name| name.to_str()),
-        target_dir.parent(),
-    ) else {
+    for candidate in retired_candidates(target_dir) {
+        if candidate.is_dir() && std::fs::rename(&candidate, target_dir).is_ok() {
+            return;
+        }
+    }
+}
+
+/// 扫一遍某账号的会话目录，把「已退役但没就位」的覆盖结果还原回原名。
+///
+/// 覆盖是「旧目录改名退役 → 临时目录改名就位」两步；进程若死在两步之间，目标路径会
+/// 消失而旧内容留在 `.old-` 下。此时预览只能把目标读成「内容缺失」，用户连重试的
+/// 入口都没有，所以自愈必须发生在**读取之前**，而不是等到下一次覆盖。
+///
+/// 只在目标路径确实不存在时动手；扫描失败一律静默跳过——自愈是尽力而为，不能反过来
+/// 挡住正常的读取路径。
+fn recover_interrupted_overwrites(spec: SessionStoreSpec, root: &Path, uid: &str) {
+    let history = vscode_session::history_root_in(spec, root, uid);
+    let Ok(workspaces) = std::fs::read_dir(&history) else {
         return;
     };
-    let retired = parent.join(format!(".old-{name}"));
-    if retired.is_dir() {
-        let _ = std::fs::rename(&retired, target_dir);
+    for workspace in workspaces.flatten() {
+        let dir = workspace.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let Some(rest) = name.strip_prefix(".old-") else {
+                continue;
+            };
+            // 目录名是会话 id（uuid），不会以 `-overwrite` 结尾：先按旧命名剥掉后缀，
+            // 剥不出来就是本版命名。
+            let canonical = rest
+                .strip_suffix(OVERWRITE_SUFFIX)
+                .filter(|stripped| !stripped.is_empty())
+                .unwrap_or(rest);
+            if canonical.is_empty() {
+                continue;
+            }
+            let target = dir.join(canonical);
+            if target.exists() {
+                continue;
+            }
+            let _ = std::fs::rename(dir.join(&name), &target);
+        }
     }
 }
 
@@ -2997,15 +3068,38 @@ mod tests {
     }
 
     // ── 覆盖的目录交接 ──────────────────────────────────────────────────
+    //
+    // 这几条用例刻意用**真实的目录名**（`history/<workspaceHash>/<conversationId>`，不带
+    // 任何后缀）。旧版用例按「目标目录名带 -overwrite」造夹具，于是写盘名与自愈名
+    // 各错一半也能同时"对上"——正是那次 bug 没被测出来的原因。
 
-    #[test]
-    fn recover_retired_target_restores_when_target_is_missing() {
+    /// 临时目录 + 一个模拟的会话目录名（uuid 形态，与真实布局一致）。
+    fn overwrite_case(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
-            "wb-overwrite-recover-{}",
+            "wb-overwrite-{name}-{}",
             uuid::Uuid::new_v4().simple()
         ));
-        let target = dir.join(format!("{CONV_SRC}{OVERWRITE_SUFFIX}"));
-        let retired = dir.join(format!(".old-{CONV_SRC}{OVERWRITE_SUFFIX}"));
+        let target = dir.join(CONV_SRC);
+        (dir, target)
+    }
+
+    #[test]
+    fn retired_dir_matches_the_name_recovery_looks_for() {
+        let (dir, target) = overwrite_case("names");
+        let written = retired_dir(&target).unwrap();
+        // 写盘用的名字必须落在自愈的候选表里，否则「退役成功、就位失败」永远修不好。
+        assert!(
+            retired_candidates(&target).contains(&written),
+            "写入名 {written:?} 不在自愈候选里"
+        );
+        assert_eq!(written, dir.join(format!(".old-{CONV_SRC}")));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recover_retired_target_restores_canonical_name() {
+        let (dir, target) = overwrite_case("recover-canonical");
+        let retired = retired_dir(&target).unwrap();
         std::fs::create_dir_all(&retired).unwrap();
         std::fs::write(retired.join("index.json"), b"{}").unwrap();
 
@@ -3020,13 +3114,23 @@ mod tests {
     }
 
     #[test]
+    fn recover_retired_target_restores_legacy_name() {
+        let (dir, target) = overwrite_case("recover-legacy");
+        // 0.1.62.x 写出的名字多带一个 `-overwrite`：升级后必须还能认出来。
+        let legacy = dir.join(format!(".old-{CONV_SRC}{OVERWRITE_SUFFIX}"));
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("index.json"), b"{}").unwrap();
+
+        recover_retired_target(&target);
+        assert!(target.join("index.json").is_file(), "旧命名也要能还原");
+        assert!(!legacy.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn recover_retired_target_never_clobbers_a_live_target() {
-        let dir = std::env::temp_dir().join(format!(
-            "wb-overwrite-keep-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        let target = dir.join(format!("{CONV_SRC}{OVERWRITE_SUFFIX}"));
-        let retired = dir.join(format!(".old-{CONV_SRC}{OVERWRITE_SUFFIX}"));
+        let (dir, target) = overwrite_case("recover-keep");
+        let retired = retired_dir(&target).unwrap();
         std::fs::create_dir_all(&target).unwrap();
         std::fs::write(target.join("index.json"), b"new").unwrap();
         std::fs::create_dir_all(&retired).unwrap();
@@ -3040,5 +3144,51 @@ mod tests {
         );
         assert!(retired.exists(), "退役目录留给覆盖流程自己清理");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn recover_interrupted_overwrites_walks_every_workspace() {
+        let fixture = Fixture::new("recover-sweep");
+        seed_source(&fixture);
+        let target_conv = copy_and_register(&fixture);
+        let target_dir = fixture.dst_conv_dir(&target_conv);
+        // 模拟「退役完成、就位前被打断」：目标路径消失，旧内容留在退役目录下。
+        let retired = dir_mate(&target_dir, OVERWRITE_SUFFIX);
+        std::fs::rename(&target_dir, &retired).unwrap();
+        assert!(!target_dir.exists());
+
+        recover_interrupted_overwrites(VSCODE_STORE, &fixture.root, DST_UID);
+
+        assert!(target_dir.is_dir(), "扫描必须把退役目录还原回原名");
+        assert!(!retired.exists(), "还原后不应残留退役目录");
+    }
+
+    /// 目标目录名加 `/` 之外的旧后缀：`<dir>-overwrite`（仅用于构造旧命名残留）。
+    fn dir_mate(target_dir: &Path, suffix: &str) -> std::path::PathBuf {
+        let name = target_dir.file_name().unwrap().to_str().unwrap();
+        target_dir.with_file_name(format!(".old-{name}{suffix}"))
+    }
+
+    /// 预览是「读」的入口：目标目录缺失时会话会显示成内容缺失，用户没有重试入口。
+    /// 自愈必须发生在预览里，这条用例从 `links_preview_at` 入口驱动。
+    #[test]
+    fn preview_repairs_an_interrupted_overwrite() {
+        let fixture = Fixture::new("preview-recover");
+        seed_source(&fixture);
+        let target_conv = copy_and_register(&fixture);
+        let target_dir = fixture.dst_conv_dir(&target_conv);
+        let retired = dir_mate(&target_dir, OVERWRITE_SUFFIX);
+        std::fs::rename(&target_dir, &retired).unwrap();
+
+        let preview =
+            links_preview_at(&fixture.root, &fixture.paths(), SRC_UID, &target_acc()).unwrap();
+
+        assert_eq!(
+            preview["groups"].as_array().unwrap().len(),
+            1,
+            "关联组必须仍然可见：{preview}"
+        );
+        assert!(target_dir.is_dir(), "预览阶段必须把退役目录还原");
+        assert!(!retired.exists());
     }
 }

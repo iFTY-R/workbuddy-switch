@@ -571,6 +571,10 @@ pub fn reveal_app_in_finder() -> Result<(), String> {
 ///
 /// async + spawn_blocking：切换中关闭/启动 WorkBuddy 会阻塞数十秒，
 /// 若在同步 command（主线程）执行会卡死整个 UI（loading 遮罩无法渲染）。
+/// 切换账号（WorkBuddy）。参数必须保持**扁平**：Tauri 的 `invoke` 与 webui 的 JSON body
+/// 都按字段名取值，收成结构体会改变对外契约；前端也确实要逐项决定（复制哪些会话、
+/// 同步哪些关联、是否迁移记忆），没有可以合理默认的组合。
+#[allow(clippy::too_many_arguments)] // 与 core 侧 `sync_pair` 同口径：参数是本次切换的显式输入
 #[tauri::command(rename_all = "camelCase")]
 pub async fn switch_account(
     app: tauri::AppHandle,

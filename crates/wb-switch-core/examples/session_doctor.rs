@@ -36,7 +36,7 @@ fn main() {
     );
 
     let mut broken: Vec<_> = results.iter().filter(|item| item.missing > 0).collect();
-    broken.sort_by(|a, b| b.missing.cmp(&a.missing));
+    broken.sort_by_key(|item| std::cmp::Reverse(item.missing));
     println!("\n-- 真缺引用最多的 10 个会话 --");
     for item in broken.iter().take(10) {
         println!(

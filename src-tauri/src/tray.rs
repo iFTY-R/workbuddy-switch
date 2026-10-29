@@ -903,9 +903,15 @@ fn format_checkin_tooltip(value: &Value) -> String {
 mod tests {
     use super::{
         format_checkin_tooltip, is_silent_startup, should_activate_on_second_launch,
-        should_keep_tray_alive, should_wake_main_window, tray_icon, tray_icon_variant, MouseButton,
+        should_keep_tray_alive, should_wake_main_window, tray_icon_variant, MouseButton,
         MouseButtonState, TrayIconVariant,
     };
+    // 平台专属符号按平台导入：无条件导入会在另外两个平台上变成 unused import，
+    // 而 `-D warnings` 下这就是编译失败（CI 只跑 macOS/Linux，永远看不到 Windows 这一侧）。
+    #[cfg(windows)]
+    use super::taskbar_uses_light_theme;
+    #[cfg(not(windows))]
+    use super::tray_icon;
     use serde_json::json;
 
     #[test]

@@ -65,10 +65,17 @@ export interface BatchJobCounts {
   failed: number;
   notRun: number;
   synced: number;
+  /**
+   * 「完成但没做全」的组里未完成的子目标数之和（补副本按账号计）。
+   *
+   * 单列出来是因为这些组 `status` 仍是 `done`：只报「完成 N 个」会让用户以为没有遗留，
+   * 而实际上还有账号没补上。
+   */
+  partialTargets: number;
 }
 
 export function jobCounts(job: SessionBatchJob | null): BatchJobCounts {
-  const counts: BatchJobCounts = { total: 0, done: 0, skipped: 0, failed: 0, notRun: 0, synced: 0 };
+  const counts: BatchJobCounts = { total: 0, done: 0, skipped: 0, failed: 0, notRun: 0, synced: 0, partialTargets: 0 };
   if (!job) return counts;
   counts.total = job.items.length;
   for (const item of job.items) {
@@ -76,6 +83,7 @@ export function jobCounts(job: SessionBatchJob | null): BatchJobCounts {
       counts.done += 1;
       // 旧报告只有 `synced`，新报告两者同值：优先读新字段。
       counts.synced += item.affected ?? item.synced;
+      counts.partialTargets += item.failedTargets ?? 0;
     } else if (item.status === "skipped") counts.skipped += 1;
     else if (item.status === "failed") counts.failed += 1;
     else if (item.status === "notRun") counts.notRun += 1;
@@ -132,7 +140,7 @@ function csvCell(value: string | number): string {
  * 列里保留“计划/完成”两个数量，便于回看“当时以为要做多少、实际做了多少”。
  */
 export function reportToCsv(job: SessionBatchJob): string {
-  const header = ["会话组", "状态", "原因", "说明", "完成数量", "计划数量", "开始时间", "结束时间"];
+  const header = ["会话组", "状态", "原因", "说明", "完成数量", "计划数量", "未完成数量", "开始时间", "结束时间"];
   const started = new Date(job.startedAt).toISOString();
   const finished = job.finishedAt ? new Date(job.finishedAt).toISOString() : "";
   const rows = job.items.map((item) => [
@@ -142,6 +150,8 @@ export function reportToCsv(job: SessionBatchJob): string {
     item.message ?? "",
     item.affected ?? item.synced,
     item.planned,
+    // 补副本的「部分未完成」要进导出：只看「完成数量」会漏掉没补上的账号。
+    item.failedTargets ?? 0,
     started,
     finished,
   ]);

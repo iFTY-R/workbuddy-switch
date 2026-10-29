@@ -1151,8 +1151,15 @@ export interface SessionBatchItem {
   synced: number;
   /** 与 `synced` 同值的通用名；旧报告没有该字段，读取时回退 `synced`。 */
   affected?: number;
-  /** 计划阶段看到的目标数。 */
+  /** 计划阶段看到的目标数（同步为落后副本数 / 删除为成员数 / 补副本为待补账号数）。 */
   planned: number;
+  /**
+   * 本项内**未完成的子目标数**（补副本按账号计）。
+   *
+   * 与 `status` 分开：一个组「补了 3 份、另 2 个账号失败」仍是 `done`，
+   * 汇总只看 status 会把它当成完全成功。
+   */
+  failedTargets?: number;
 }
 
 /** 一次批量任务的完整状态；任务由后端线程推进，前端轮询这个结构。 */

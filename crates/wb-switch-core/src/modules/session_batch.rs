@@ -91,6 +91,11 @@ pub struct BatchItem {
     pub affected: usize,
     /// 计划阶段看到的目标数（Sync 为落后副本数，Delete 为成员数，Copy 为待补账号数）。
     pub planned: usize,
+    /// 本项内**未完成的子目标数**（补副本按账号计，Sync/Delete 恒为 0）。
+    ///
+    /// 与 `status` 分开记：一个组「补了 3 份、另 2 个账号失败」仍然是 `done`（写进去的是
+    /// 事实），但汇总如果只看 status 就会把它当成完全成功——用户会以为没有遗留问题。
+    pub failed_targets: usize,
     /// Copy 专用：本组要补到的账号 id（计划阶段算出，执行阶段照单执行）。
     ///
     /// 不进报告：报告是给人看的，账号 id 对用户没有意义，真正的结果记在 `affected`
@@ -114,6 +119,7 @@ impl BatchItem {
             synced: 0,
             affected: 0,
             planned: 0,
+            failed_targets: 0,
             copy_targets: Vec::new(),
             copy_source: None,
         }
@@ -143,11 +149,13 @@ impl BatchItem {
     /// 完成但**不干净**：补了一部分、剩下的失败。
     ///
     /// 不能因为「有一份没补上」就把整组标成失败——已经写进去的副本是事实，
-    /// 报告要如实说「补了 N 份，另有 M 个账号失败」。
-    fn done_with_note(mut self, count: usize, note: String) -> Self {
+    /// 报告要如实说「补了 N 份，另有 M 个账号失败」。`failed` 单独计数，
+    /// 让汇总能把这类组与「完全成功」区分开。
+    fn done_with_note(mut self, count: usize, failed: usize, note: String) -> Self {
         self.status = ITEM_DONE.to_string();
         self.synced = count;
         self.affected = count;
+        self.failed_targets = failed;
         self.message = Some(note);
         self
     }
@@ -531,8 +539,8 @@ fn run_job(job_id: &str) {
         let item = items[index].clone();
         match execute_item(client, scope, op, &item) {
             Ok(ItemOutcome::Done(count)) => items[index] = item.done(count),
-            Ok(ItemOutcome::DoneWithNote(count, note)) => {
-                items[index] = item.done_with_note(count, note)
+            Ok(ItemOutcome::DoneWithNote(count, failed, note)) => {
+                items[index] = item.done_with_note(count, failed, note)
             }
             Ok(ItemOutcome::Skipped(code, message)) => items[index] = item.skipped(code, message),
             Ok(ItemOutcome::Failed(code, message, fatal)) => {
@@ -595,8 +603,8 @@ fn run_job(job_id: &str) {
 
 enum ItemOutcome {
     Done(usize),
-    /// 完成了一部分：`count` 是成功数，`note` 说明剩下为什么没成。
-    DoneWithNote(usize, String),
+    /// 完成了一部分：`count` 是成功数，`failed` 是未完成的子目标数，`note` 说明为什么没成。
+    DoneWithNote(usize, usize, String),
     Skipped(&'static str, String),
     /// (原因码, 可读消息, 是否中止整批)
     Failed(&'static str, String, bool),
@@ -681,6 +689,7 @@ fn execute_copy(
         } else {
             ItemOutcome::DoneWithNote(
                 copied,
+                failures.len(),
                 format!(
                     "已补 {copied} 份；另有 {} 个账号未完成：{}",
                     failures.len(),

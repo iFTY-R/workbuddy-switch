@@ -545,3 +545,22 @@ fn copy_batch_rejects_oversized_total_before_spawning() {
     let error = start_copy(SessionClient::Workbuddy, None, &keys, &targets, false).unwrap_err();
     assert!(error.contains("超过单批上限"), "{error}");
 }
+
+#[test]
+fn done_with_note_records_failed_subtargets() {
+    // 「补了 2 份、另 1 个账号失败」仍然是 done：写进去的是事实。
+    // 但失败数必须单独记，否则汇总会把它当成完全成功。
+    let item = BatchItem::new("k".into(), "g1", "t".into()).done_with_note(
+        2,
+        1,
+        "已补 2 份；另有 1 个账号未完成：x".to_string(),
+    );
+    assert_eq!(item.status, ITEM_DONE);
+    assert_eq!(item.affected, 2);
+    assert_eq!(item.failed_targets, 1);
+    assert!(item.message.is_some());
+
+    // 完全成功的项不带失败数，汇总不会误加。
+    let clean = BatchItem::new("k".into(), "g1", "t".into()).done(3);
+    assert_eq!(clean.failed_targets, 0);
+}

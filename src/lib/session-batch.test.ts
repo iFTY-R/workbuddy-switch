@@ -112,11 +112,20 @@ function item(status: SessionBatchJob["items"][number]["status"], key: string, s
 describe("jobCounts", () => {
   it("分别统计四类状态与成功副本数", () => {
     const counts = jobCounts(job([item("done", "a", 2), item("skipped", "b"), item("failed", "c"), item("notRun", "d")]));
-    expect(counts).toEqual({ total: 4, done: 1, skipped: 1, failed: 1, notRun: 1, synced: 2 });
+    expect(counts).toEqual({ total: 4, done: 1, skipped: 1, failed: 1, notRun: 1, synced: 2, partialTargets: 0 });
   });
 
   it("空任务返回全零而不是 NaN", () => {
-    expect(jobCounts(null)).toEqual({ total: 0, done: 0, skipped: 0, failed: 0, notRun: 0, synced: 0 });
+    expect(jobCounts(null)).toEqual({ total: 0, done: 0, skipped: 0, failed: 0, notRun: 0, synced: 0, partialTargets: 0 });
+  });
+
+  it("完成但没做全的组，失败子目标数单独累计", () => {
+    // 「补了 2 份、另 1 个账号失败」仍是 done：汇总不能把它当成完全成功。
+    const partial = { ...item("done", "a", 2), failedTargets: 1 };
+    const counts = jobCounts(job([partial, item("done", "b", 3)]));
+    expect(counts.done).toBe(2);
+    expect(counts.synced).toBe(5);
+    expect(counts.partialTargets).toBe(1);
   });
 });
 
@@ -162,7 +171,7 @@ describe("reportToCsv", () => {
   it("旧报告缺 affected 时回退 synced", () => {
     const legacy = { key: "k", groupId: "g", title: "旧报告", status: "done" as const, synced: 3, planned: 1 };
     const csv = reportToCsv(job([legacy as never]));
-    expect(csv).toContain("旧报告,已完成,,,3,1");
+    expect(csv).toContain("旧报告,已完成,,,3,1,0");
   });
 
   it("公式开头的字段前置制表符，避免 Excel 当公式执行", () => {

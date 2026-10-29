@@ -261,3 +261,61 @@ describe("SessionBatchDialog 补副本重试", () => {
     expect(callbacks.onRetryFailed).toHaveBeenCalledWith([{ key: "k2", groupId: "g-k2" }], ["acc-1"]);
   });
 });
+
+describe("SessionBatchDialog 汇总口径", () => {
+  it("完成但没做全的组要在汇总里点出来，而不是只报「完成 1」", () => {
+    const partial: SessionBatchJob = {
+      jobId: "job-partial",
+      client: "workbuddy",
+      op: "copy",
+      state: "finished",
+      total: 1,
+      done: 1,
+      current: null,
+      aborted: null,
+      cancelled: false,
+      startedAt: 1,
+      finishedAt: 2,
+      targetAccountIds: ["acc-1", "acc-2"],
+      items: [
+        {
+          key: "k1",
+          groupId: "g-k1",
+          title: "会话一",
+          status: "done",
+          message: "已补 1 份；另有 1 个账号未完成：acc-2：写入失败",
+          synced: 1,
+          affected: 1,
+          planned: 2,
+          failedTargets: 1,
+        },
+      ],
+    };
+    renderDialog({ op: "copy", job: partial });
+
+    expect(screen.getByText(/完成 1 · 跳过 0 · 失败 0 · 未执行 0/)).toBeTruthy();
+    // 只报「完成 1」会让人以为没有遗留；未完成的账号数必须单独出现。
+    expect(screen.getByText(/其中 1 个账号未完成/)).toBeTruthy();
+  });
+
+  it("完全成功时不出现「未完成」提示", () => {
+    const clean: SessionBatchJob = {
+      jobId: "job-clean",
+      client: "workbuddy",
+      op: "copy",
+      state: "finished",
+      total: 1,
+      done: 1,
+      current: null,
+      aborted: null,
+      cancelled: false,
+      startedAt: 1,
+      finishedAt: 2,
+      items: [
+        { key: "k1", groupId: "g-k1", title: "会话一", status: "done", synced: 2, affected: 2, planned: 2 },
+      ],
+    };
+    renderDialog({ op: "copy", job: clean });
+    expect(screen.queryByText(/个账号未完成/)).toBeNull();
+  });
+});

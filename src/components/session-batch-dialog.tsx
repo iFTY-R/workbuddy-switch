@@ -6,7 +6,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Switch } from "@/components/ui/switch";
 import * as api from "@/lib/api";
-import { MAX_BATCH_COPIES, MAX_BATCH_GROUPS, MAX_COPY_TARGETS, retryTargets, type BatchPlanPreview } from "@/lib/session-batch";
+import { MAX_BATCH_COPIES, MAX_BATCH_GROUPS, MAX_COPY_TARGETS, jobCounts, retryTargets, type BatchPlanPreview } from "@/lib/session-batch";
 import { displayName } from "@/lib/account-display";
 import type { AccountMeta, SessionBatchItem, SessionBatchJob, SessionBatchOp, SessionBatchTarget, SessionGroupSummary } from "@/lib/types";
 
@@ -89,6 +89,7 @@ export function SessionBatchDialog({
   const running = starting || (job !== null && job.state !== "finished" && job.state !== "interrupted");
   const selectedGroups = groups.filter((group) => selected.has(group.key));
   const retry = job ? retryTargets(job) : [];
+  const counts = jobCounts(job);
   const progress = job && job.total > 0 ? Math.round((job.done / job.total) * 100) : 0;
   const overLimit = !job && preview.total > MAX_BATCH_GROUPS;
   const currentTitle = job?.current
@@ -320,10 +321,22 @@ export function SessionBatchDialog({
         )}
 
         <DialogFooter className="shrink-0 sm:justify-between">
-          <div className="text-xs text-muted-foreground">
-            {job
-              ? `完成 ${job.items.filter((item) => item.status === "done").length} · 跳过 ${job.items.filter((item) => item.status === "skipped").length} · 失败 ${job.items.filter((item) => item.status === "failed").length} · 未执行 ${job.items.filter((item) => item.status === "notRun").length}`
-              : `共 ${preview.total} 个会话组`}
+          <div className="min-w-0 space-y-0.5 text-xs text-muted-foreground">
+            {job ? (
+              <>
+                <div>
+                  完成 {counts.done} · 跳过 {counts.skipped} · 失败 {counts.failed} · 未执行 {counts.notRun}
+                </div>
+                {/* 这些组 status 是 done，但还有账号没补上：不单独说，用户会以为全做完了。 */}
+                {counts.partialTargets > 0 && (
+                  <div className="text-amber-700 dark:text-amber-400">
+                    其中 {counts.partialTargets} 个账号未完成（见各组说明）
+                  </div>
+                )}
+              </>
+            ) : (
+              `共 ${preview.total} 个会话组`
+            )}
           </div>
           <div className="flex shrink-0 gap-2">
             {running ? (

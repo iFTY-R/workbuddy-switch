@@ -921,8 +921,17 @@ fn prune_retained(paths: &SessionPaths, variant: WbVariant) {
         .len()
         .saturating_sub(excess_count(&sizes, MAX_RETAINED_SYNC_BYTES));
     for (index, record) in kept.iter().enumerate() {
-        let expired = record.retain_until.is_some_and(|until| until <= now);
-        if expired || index >= MAX_RETAINED_SYNC_BACKUPS || index >= cutoff {
+        if record.retain_until.is_some_and(|until| until <= now) {
+            let _ = cleanup_operation(paths, variant, record);
+            continue;
+        }
+        // 最新一份只要还在保留期内就留着：它是「刚才那次覆盖」的唯一退路。
+        // 即便它自己就超了体积预算，也不该被「省磁盘」删掉——那等于把这个功能
+        // 存在的理由删了。超出部分最多一份库快照，可由用户手动清理。
+        if index == 0 {
+            continue;
+        }
+        if index >= MAX_RETAINED_SYNC_BACKUPS || index >= cutoff {
             let _ = cleanup_operation(paths, variant, record);
         }
     }

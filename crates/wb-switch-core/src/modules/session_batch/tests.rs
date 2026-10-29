@@ -119,6 +119,7 @@ fn finished_job_snapshot_reports_counts_and_items() {
     let mut job = BatchJob {
         id: "job-1".to_string(),
         client: SessionClient::Workbuddy,
+        scope: Some(WbVariant::Cn),
         op: BatchOp::Sync,
         allow_restart: false,
         state: "running".to_string(),

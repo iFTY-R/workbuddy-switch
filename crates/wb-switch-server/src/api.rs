@@ -962,16 +962,17 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
         *running = true;
         *lock_or_recover(&SWITCH_PROGRESS) = Some("开始切换账号…".to_string());
     }
-    // 复位必须挂在 Drop 上：客户端断开连接时 axum 会直接 drop 本 handler 的 future，
-    // 写在 `.await` 之后的复位语句就永远跑不到，运行标志会一直为 true ——
-    // 之后每次切换都 409「已有切换任务进行中」，只能重启服务。
-    let _run_guard = SwitchRunGuard;
 
     let progress: switch::ProgressFn = Box::new(|msg| {
         *lock_or_recover(&SWITCH_PROGRESS) = Some(msg.to_string());
     });
 
     let result = tokio::task::spawn_blocking(move || {
+        // 守卫必须跟着「真正在干活的那个任务」走，不能跟着请求 future：
+        // 客户端断连时 axum 只 drop 了 future，`spawn_blocking` 里的切号仍在跑；
+        // 若在 future 的 Drop 里复位，下一次请求会与它并发，两个切号同时改 auth.info。
+        // 放在闭包里，则「工作结束（含 panic）才释放」，断连也不影响正确性。
+        let _run_guard = SwitchRunGuard;
         switch::switch_account(
             Some(&progress),
             &account_id,
@@ -990,7 +991,10 @@ async fn api_switch(Json(body): Json<Value>) -> Response {
     }
 }
 
-/// 切换运行标志的守卫：离开作用域（含 future 被 drop）即复位。
+/// 切换运行标志的守卫：跟随**执行体**（`spawn_blocking` 闭包），离开作用域即复位。
+///
+/// 早先它挂在请求 future 上：断连时 future 被 drop，标志提前归位，而切号仍在后台跑，
+/// 于是下一次请求能与它并发。现在只有工作真正结束（正常返回或 panic）才复位。
 struct SwitchRunGuard;
 
 impl Drop for SwitchRunGuard {

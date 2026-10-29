@@ -132,6 +132,8 @@ struct PlannedGroup {
 struct BatchJob {
     id: String,
     client: SessionClient,
+    /// 档位范围：计划与执行都必须沿用它，否则「在 cn 页面上操作」会波及同 id 的其它档位。
+    scope: Option<WbVariant>,
     op: BatchOp,
     allow_restart: bool,
     state: String,
@@ -188,14 +190,22 @@ fn with_jobs<T>(f: impl FnOnce(&mut HashMap<String, BatchJob>) -> T) -> T {
 }
 
 /// 取后台线程开工所需的参数（避免线程长期持锁）。
-/// 后台线程开工所需的参数：客户端、动作、`(选择键, 组 id)` 列表、是否允许关闭客户端。
-type JobParams = (SessionClient, BatchOp, Vec<(String, String)>, bool);
+/// 后台线程开工所需的参数：客户端、档位范围、动作、`(选择键, 组 id)` 列表、
+/// 是否允许关闭客户端。
+type JobParams = (
+    SessionClient,
+    Option<WbVariant>,
+    BatchOp,
+    Vec<(String, String)>,
+    bool,
+);
 
 fn job_params(job_id: &str) -> Option<JobParams> {
     with_jobs(|jobs| {
         let job = jobs.get(job_id)?;
         Some((
             job.client,
+            job.scope,
             job.op,
             job.items
                 .iter()
@@ -246,6 +256,7 @@ fn start(
     let job = BatchJob {
         id: id.clone(),
         client,
+        scope,
         op,
         allow_restart,
         state: "queued".to_string(),
@@ -332,7 +343,7 @@ fn normalize_items(
 }
 
 fn run_job(job_id: &str) {
-    let Some((client, op, targets, allow_restart)) = job_params(job_id) else {
+    let Some((client, scope, op, targets, allow_restart)) = job_params(job_id) else {
         return;
     };
     let paths = client.store_paths();
@@ -367,7 +378,7 @@ fn run_job(job_id: &str) {
         if cancel_requested(job_id) {
             break;
         }
-        let planned = plan_group(client, None, group_id, op, allow_restart);
+        let planned = plan_group(client, scope, group_id, op, allow_restart);
         for variant in &planned.restart_variants {
             if !restart_variants.contains(variant) {
                 restart_variants.push(*variant);
@@ -424,7 +435,7 @@ fn run_job(job_id: &str) {
         // 「可能已部分写入」，而不是和没碰过的组一样显示 pending。
         checkpoint(job_id);
         let item = items[index].clone();
-        match execute_item(client, op, &item.group_id) {
+        match execute_item(client, scope, op, &item.group_id) {
             Ok(ItemOutcome::Done(count)) => items[index] = item.done(count),
             Ok(ItemOutcome::Skipped(code, message)) => items[index] = item.skipped(code, message),
             Ok(ItemOutcome::Failed(code, message, fatal)) => {
@@ -492,14 +503,19 @@ enum ItemOutcome {
     Failed(&'static str, String, bool),
 }
 
-fn execute_item(client: SessionClient, op: BatchOp, group_id: &str) -> Result<ItemOutcome, String> {
+fn execute_item(
+    client: SessionClient,
+    scope: Option<WbVariant>,
+    op: BatchOp,
+    group_id: &str,
+) -> Result<ItemOutcome, String> {
     match op {
         BatchOp::Sync => {
-            let report = session_groups::sync_safe_batch(client, None, group_id, false)?;
+            let report = session_groups::sync_safe_batch(client, scope, group_id, false)?;
             Ok(summarize_sync_report(&report))
         }
         BatchOp::Delete => {
-            let report = session_groups::delete_group(client, None, group_id)?;
+            let report = session_groups::delete_group(client, scope, group_id)?;
             let removed = report.get("removed").and_then(Value::as_u64).unwrap_or(0) as usize;
             Ok(ItemOutcome::Done(removed))
         }

@@ -455,6 +455,50 @@ export interface SwitchResult {
   /** 本次的会话同步报告（未勾选同步时不返回）；含跳过与失败原因，不只是成功数。 */
   sessionSync?: SessionSyncReport;
   sessionRecovery?: SessionRecoveryReport;
+  /** 记忆迁移结果（未勾选时不返回）；三种结局都在这，失败不影响切换成功。 */
+  memoryMigration?: MemoryMigrationResult;
+}
+
+/** 一份记忆文件的概况：只描述事实，不含正文。 */
+export interface MemoryFileInfo {
+  path: string;
+  bytes: number;
+  /** 记忆正文的字符数；0 表示「有文件但没有内容」。 */
+  blockChars: number;
+  updatedAt: string | null;
+  /** 来自旧拼写目录 `memery/`（只读，不会写回）。 */
+  legacy: boolean;
+}
+
+/** 记忆迁移预检：勾选「迁移记忆」后据此提示会发生什么。 */
+export interface MemoryPreview {
+  variant: string;
+  sourceUid: string;
+  targetUid: string;
+  source: MemoryFileInfo | null;
+  target: MemoryFileInfo | null;
+  /** 目标已有非空记忆：切换时**不会**自动覆盖，只会跳过并给出原因。 */
+  targetHasMemory: boolean;
+  /** 不覆盖即可直接执行。 */
+  canApply: boolean;
+  blockedReason: string | null;
+}
+
+/** 切换流程内的记忆迁移结局：成功 / 跳过（含原因）/ 失败都收敛在这里。 */
+export interface MemoryMigrationResult {
+  status: "copied" | "skipped";
+  sourceUid?: string;
+  targetUid?: string;
+  reason?: string;
+  report?: {
+    copied: boolean;
+    sourcePath: string;
+    targetPath: string;
+    /** 覆盖前的备份；没有覆盖就是 `null`。 */
+    backup: string | null;
+    uidRewritten: boolean;
+    skippedReason: string | null;
+  };
 }
 
 export interface CheckinConfig {

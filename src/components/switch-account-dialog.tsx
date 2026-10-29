@@ -5,6 +5,7 @@ import { toast } from "sonner";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
   Dialog,
   DialogContent,
@@ -23,6 +24,7 @@ import { displayName } from "@/lib/account-display";
 import { accountVariant, variantAppName } from "@/lib/variant";
 import type {
   AccountMeta,
+  MemoryPreview,
   Session,
   SessionLinkPreviewGroup,
   SessionSyncSelection,
@@ -95,6 +97,13 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
   const [tab, setTab] = useState<"links" | "copy">("links");
   /** 关联会话区块上报的状态：tab 徽标与常驻提示用。 */
   const [linksMeta, setLinksMeta] = useState<SessionLinksMeta | null>(null);
+  /** 账号记忆迁移：默认不迁，勾选后才带走（并先预检让用户知道迁什么）。 */
+  const [migrateMemory, setMigrateMemory] = useState(false);
+  const [memoryPreview, setMemoryPreview] = useState<MemoryPreview | null>(null);
+  /** 覆盖目标账号已有的记忆：只有预检发现目标非空时才出现这个选择。 */
+  const [memoryOverwrite, setMemoryOverwrite] = useState(false);
+  const [memoryLoading, setMemoryLoading] = useState(false);
+  const [memoryError, setMemoryError] = useState<string | null>(null);
 
   const variant = accountVariant(account);
   const accountId = account?.id;
@@ -133,6 +142,11 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     setSyncSelections([]);
     setSyncGroups([]);
     setLinksMeta(null);
+    setMigrateMemory(false);
+    setMemoryPreview(null);
+    setMemoryOverwrite(false);
+    setMemoryError(null);
+    setMemoryLoading(false);
     setTab("links");
     setLoadingSessions(true);
     void api.listSessions(variant)
@@ -179,6 +193,29 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
     });
   }
 
+  /**
+   * 勾选记忆迁移：立刻预检一次，把「有没有得迁、目标是否已有记忆」讲清楚。
+   *
+   * 预检失败不阻止勾选——真正执行在切换流程里，失败会以「跳过 + 原因」回报；
+   * 这里只把原因摆出来，避免用户以为勾了就一定迁成功。
+   */
+  async function toggleMigrateMemory(next: boolean) {
+    setMigrateMemory(next);
+    setMemoryError(null);
+    // 取消迁移时把「覆盖」一起收回：留着它会让下次勾选莫名其妙变成覆盖模式。
+    if (!next) setMemoryOverwrite(false);
+    if (!next || !accountId || memoryPreview) return;
+    setMemoryLoading(true);
+    try {
+      const preview = await api.accountMemoryPreview(accountId);
+      setMemoryPreview(preview);
+    } catch (e) {
+      setMemoryError(api.asError(e));
+    } finally {
+      setMemoryLoading(false);
+    }
+  }
+
   async function doSwitch() {
     if (!account) return;
     setBusy(true);
@@ -192,6 +229,10 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
         copySessionIds: requestedCopy ? [...selected] : undefined,
         // 勾选绑定预览凭据；执行前后端会重新校验，版本变化则跳过该项。
         syncSelections: requestedSync ? syncSelections : undefined,
+        // 记忆迁移是显式选择：不勾就不传，后端默认不迁移。
+        migrateMemory: migrateMemory || undefined,
+        // 覆盖同理：只有用户看到「目标已有记忆」后主动勾选才传。
+        memoryOverwrite: (migrateMemory && memoryOverwrite) || undefined,
       });
       const nickname = displayName(account);
       const parts: string[] = [];
@@ -209,6 +250,9 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       if (syncedItems.length > 0) parts.push(`已同步 ${syncedItems.length} 个会话`);
       if (skippedItems.length > 0) parts.push(`跳过 ${skippedItems.length} 个会话`);
       if (syncErrors.length > 0) parts.push(`会话同步失败 ${syncErrors.length} 个`);
+      // 记忆迁移的三种结局都收敛在 memoryMigration 里：成功进摘要，跳过单独提示。
+      const memory = res.memoryMigration;
+      if (migrateMemory && memory?.status === "copied") parts.push("已迁移账号记忆");
       if (res.backup) parts.push(`备份: ${res.backup}`);
       // 成功清理：临时备份已回收，不再展示可还原路径；待清理项单独提示，不写进成功文案。
       toast.success(`已切换至「${nickname}」`, {
@@ -256,6 +300,14 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
       if (syncReport?.needsRecovery) {
         toast.error("有会话同步没有完成", {
           description: "已保留操作记录与备份，下次切换会先恢复；恢复完成前不会再改动目标账号的内容。",
+        });
+      }
+      // 记忆没迁成功必须说清原因（目标已有记忆、来源为空、格式不认识），
+      // 不能让「账号已切换」的成功提示盖掉这件事。
+      if (migrateMemory && (!memory || memory.status === "skipped")) {
+        toast.warning("账号记忆未迁移", {
+          description:
+            memory?.reason ?? "没有收到记忆迁移结果：当前版本可能不支持迁移记忆，账号已切换。",
         });
       }
       // 未完成的会话写入：可重试项只提示，阻断项由后端直接返回错误。
@@ -380,8 +432,28 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
           : syncCount === 0
             ? "未选择同步会话"
             : null;
-  const needsPermission = error.includes("无权限");
-  const sessionsEmpty = !loadingSessions && sessions.length === 0;
+  /** 记忆迁移的说明：勾选前讲规则，勾选后讲事实（预检结果）。 */
+  const memoryHint = (() => {
+    if (!migrateMemory) {
+      return "记忆是账号级文件，默认不迁移；勾选后把当前账号的记忆带到目标账号。";
+    }
+    if (memoryLoading) return "正在检查两边的记忆…";
+    if (memoryError) return memoryError;
+    if (!memoryPreview) return "将在切换时迁移当前账号的记忆。";
+    if (memoryPreview.targetHasMemory) {
+      // 不覆盖是刻意的：静默替换等于替用户删掉目标账号的记忆。
+      const chars = memoryPreview.target?.blockChars ?? 0;
+      return memoryOverwrite
+        ? `将替换目标账号现有的 ${chars} 字记忆（原文件备份到 ~/.wb-switch/backups/memory）。`
+        : `目标账号已有 ${chars} 字记忆，本次不会覆盖；勾选下方选项可替换。`;
+    }
+    if (!memoryPreview.source) return "当前账号没有记忆文件，切换时不会迁移任何内容。";
+    if ((memoryPreview.source.blockChars ?? 0) === 0) {
+      return "当前账号的记忆是空的，切换时不会迁移任何内容。";
+    }
+    return `将迁移约 ${memoryPreview.source.blockChars} 字记忆到目标账号（当前账号的文件保留）。`;
+  })();
+  const needsPermission = error.includes("无权限");  const sessionsEmpty = !loadingSessions && sessions.length === 0;
   const copyHint = loadingSessions
     ? "正在加载会话…"
     : error && sessionsEmpty
@@ -568,6 +640,40 @@ export function SwitchAccountDialog({ open, onOpenChange, account, onDone }: Pro
             </Tabs>
           ) : (
             <div className="min-h-0 space-y-2 overflow-y-auto">{copyTabContent}</div>
+          )}
+        </div>
+
+        {/* 记忆迁移：与两个 tab 无关，所以放在 tab 内容区之外，切换 tab 不会丢勾选。 */}
+        <div className="shrink-0 space-y-1">
+          <label className="flex cursor-pointer items-start gap-2.5 rounded-lg px-1 py-1.5 text-sm hover:bg-muted/60">
+            <Checkbox
+              checked={migrateMemory}
+              onCheckedChange={(on) => void toggleMigrateMemory(Boolean(on))}
+              disabled={busy}
+              aria-label="迁移账号记忆"
+              className="mt-0.5"
+            />
+            <span className="min-w-0">
+              <span className="font-medium">迁移账号记忆</span>
+              <span className="mt-0.5 block break-words text-xs leading-4 text-muted-foreground">
+                {memoryHint}
+              </span>
+            </span>
+          </label>
+          {/* 只有目标确实已有记忆时才给「覆盖」：没东西可覆盖时不制造多余的风险选项。 */}
+          {migrateMemory && memoryPreview?.targetHasMemory && (
+            <label className="ml-7 flex cursor-pointer items-start gap-2.5 rounded-lg px-1 py-1 text-xs text-muted-foreground hover:bg-muted/60">
+              <Checkbox
+                checked={memoryOverwrite}
+                onCheckedChange={(on) => setMemoryOverwrite(Boolean(on))}
+                disabled={busy}
+                aria-label="覆盖目标账号已有的记忆"
+                className="mt-0.5"
+              />
+              <span className="min-w-0 break-words leading-4">
+                覆盖目标账号已有的记忆（原文件会先备份）
+              </span>
+            </label>
           )}
         </div>
 

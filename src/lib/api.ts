@@ -21,6 +21,7 @@ import type {
   GithubConfig,
   ImportPreviewAccount,
   ImportResult,
+  MemoryPreview,
   OAuthPollResult,
   OAuthStartResult,
   RateLimitConfig,
@@ -175,6 +176,7 @@ const ROUTES: Record<string, Route> = {
   session_context_integrity: { method: "POST", path: "/api/session-context/integrity" },
   session_context_backfill: { method: "POST", path: "/api/session-context/backfill" },
   session_context_gc: { method: "POST", path: "/api/session-context/gc" },
+  account_memory_preview: { method: "POST", path: "/api/account-memory/preview" },
   get_checkin_status: { method: "GET", path: "/api/checkin/status" },
   get_credit_expiry: { method: "POST", path: "/api/credits" },
   get_credit_statistics: { method: "GET", path: "/api/credits/stats" },
@@ -560,8 +562,21 @@ export function switchAccount(args: {
   shareSessions?: boolean;
   copySessionIds?: string[];
   syncSelections?: SessionSyncSelection[];
+  /** 把切换前账号的记忆带到目标账号；缺省不迁移（显式选择才做）。 */
+  migrateMemory?: boolean;
+  /** 覆盖目标账号已有的记忆（原文件会备份）；缺省不覆盖。 */
+  memoryOverwrite?: boolean;
 }): Promise<SwitchResult> {
   return call("switch_account", args as unknown as Record<string, unknown>);
+}
+
+/**
+ * 记忆迁移预检（只读）：源是当前登录账号，目标是 `accountId`。
+ *
+ * 只报告两边各有什么，不建目录、不写文件——用户取消勾选不会留下痕迹。
+ */
+export function accountMemoryPreview(accountId: string): Promise<MemoryPreview> {
+  return call("account_memory_preview", { accountId });
 }
 
 /** 切换进度（webui 轮询用；桌面端走事件，此函数无副作用）。 */

@@ -4164,6 +4164,10 @@ fn sync_fast_forward_replaces_body_and_advances_pair_baseline() {
     let pair_ref_before = pair_ref_of(&group_snapshot(&env, &group_id), "uid-a", "uid-b");
     let baselines_before = env.baseline_files();
     let edge_db_before = std::fs::read(env.paths.edge_sync_db(WbVariant::Cn)).unwrap();
+    // 源会话的文件检查点：同步是整篇正文替换，这些备份必须跟到目标会话目录下。
+    let source_history = env.paths.data_root.join("file-history").join("sess-1");
+    std::fs::create_dir_all(&source_history).unwrap();
+    std::fs::write(source_history.join("abc123@v1"), b"checkpoint").unwrap();
 
     let report = sync(
         &env,
@@ -4184,6 +4188,25 @@ fn sync_fast_forward_replaces_body_and_advances_pair_baseline() {
     assert_eq!(synced[0]["recordCount"]["source"], 5);
     assert_eq!(synced[0]["recordCount"]["targetBefore"], 2);
     assert_eq!(synced[0]["recordCount"]["target"], 5);
+
+    // 同步把源正文整篇搬过来，文件检查点必须一起落到目标会话目录下：
+    // 客户端按 `file-history/<sessionId>/<backupFileName>` 取，目录名不对就全部悬空。
+    assert!(
+        env.paths
+            .data_root
+            .join("file-history")
+            .join(&target_id)
+            .join("abc123@v1")
+            .is_file(),
+        "同步后目标会话目录必须拿到源的检查点备份"
+    );
+    let sidecars: Vec<&str> = synced[0]["sidecars"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert!(sidecars.contains(&"fileHistory"), "{report}");
 
     // 覆盖类操作成功后保留旧内容备份（保留期内可恢复）：摘要校验只能证明「写进去的
     // 字节 = 计划的字节」，不能证明内容本身正确，所以必须留一条退路。
@@ -6279,4 +6302,76 @@ fn session_id_guard_rejects_path_segments() {
     assert!(!is_session_id_like("../x"));
     assert!(!is_session_id_like("a/b"));
     assert!(!is_session_id_like(""));
+}
+
+// ── 用量与同步标记 ────────────────────────────────────────────────────
+
+#[test]
+fn copy_carries_session_usage_row() {
+    let env = ready_env("usage-copy");
+    let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE session_usage (
+            session_id TEXT PRIMARY KEY,
+            used INTEGER NOT NULL,
+            size INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            credit_json TEXT
+        );",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO session_usage (session_id, used, size, updated_at, credit_json)
+         VALUES ('sess-1', 425769, 1000000, 1, '{\"r1\":1.5}')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let report = copy(&env, "uid-b", &["sess-1"]);
+    let new_id = env.first_copy_id(&report);
+
+    let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+    let row: (i64, i64, Option<String>) = conn
+        .query_row(
+            "SELECT used, size, credit_json FROM session_usage WHERE session_id = ?1",
+            [&new_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("副本必须有用量行，否则「上下文用量」显示为 0");
+    assert_eq!(row.0, 425769);
+    assert_eq!(row.1, 1000000);
+    assert_eq!(row.2.as_deref(), Some("{\"r1\":1.5}"));
+}
+
+#[test]
+fn copy_clears_cloud_sync_markers() {
+    let env = ready_env("agent-markers");
+    let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+    conn.execute_batch(
+        "ALTER TABLE sessions ADD COLUMN agent_dirty INTEGER;
+         ALTER TABLE sessions ADD COLUMN agent_dirty_at INTEGER;
+         ALTER TABLE sessions ADD COLUMN agent_last_synced INTEGER;",
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE sessions SET agent_dirty = 1, agent_dirty_at = 111, agent_last_synced = 222
+         WHERE id = 'sess-1'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let report = copy(&env, "uid-b", &["sess-1"]);
+    let new_id = env.first_copy_id(&report);
+
+    let conn = Connection::open(env.paths.workbuddy_db()).unwrap();
+    let row: (Option<i64>, Option<i64>, Option<i64>) = conn
+        .query_row(
+            "SELECT agent_dirty, agent_dirty_at, agent_last_synced FROM sessions WHERE id = ?1",
+            [&new_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(row, (None, None, None), "副本不该继承源会话的云端同步进度");
 }

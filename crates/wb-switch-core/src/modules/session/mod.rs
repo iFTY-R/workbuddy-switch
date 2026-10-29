@@ -604,6 +604,14 @@ fn copy_visibility_override(
         "unread" => (inherited != &Value::Integer(0)).then_some(Value::Integer(0)),
         // 客户端 `rowMode()` 缺省回落 craft；显式补齐，别让 NULL 参与渲染分支。
         "source_mode" => matches!(inherited, Value::Null).then(|| Value::Text("craft".to_string())),
+        // 这三个字段描述「本会话的云端同步进度」，属于源账号的源会话；副本不存在任何
+        // 同步进度，沿用旧值等于替客户端断言一个不成立的进度。
+        // 依据：客户端迁移里它们可空且以 `agentDirty`/`agentLastSynced` 透出
+        // （app.asar → `agent_dirty AS agentDirty`），副本没有对应上传记录。
+        // 未验证项：客户端读到 NULL 后是否会重新上传（见 V3）。
+        "agent_dirty" | "agent_dirty_at" | "agent_last_synced" => {
+            (!matches!(inherited, Value::Null)).then_some(Value::Null)
+        }
         _ => None,
     }
 }
@@ -711,7 +719,60 @@ fn insert_session_copy(
     let params: Vec<&rusqlite::types::Value> = vals.iter().collect();
     conn.execute(&sql, rusqlite::params_from_iter(params))
         .map_err(|e| format!("会话记录保存失败：{e}"))?;
+
+    // 用量行同样是会话维度：`used` 是当前上下文占用、`size` 是窗口（实测某会话
+    // `used=425769`，与其最后一条 assistant 的 `usage.total_tokens=425883` 同量级，
+    // 不是累计值）。不复制的话，副本详情页的「上下文用量」是 0。
+    // 列定义依据客户端迁移：`session_usage(session_id PK, used, size, updated_at, credit_json)`。
+    if same_db {
+        copy_session_usage_row(&conn, &conn, cid, new_cid, now)?;
+    } else if let Some(source_conn) = open_db(&src_db, true) {
+        copy_session_usage_row(&source_conn, &conn, cid, new_cid, now)?;
+    }
+
     Ok(DbCopyOutcome::Inserted(normalized))
+}
+
+/// 复制 `session_usage` 行（`used`/`size`/`credit_json`）。
+///
+/// 与 `sessions` 不同，这里可以用 `INSERT OR REPLACE`：主键是本次新分配的会话 id，
+/// 撞库只可能发生在恢复重放，语义正是「把上次写的同一行再写一次」。
+/// 旧客户端的库里可能没有这张表；此时跳过，不当成复制失败。
+fn copy_session_usage_row(
+    source: &rusqlite::Connection,
+    target: &rusqlite::Connection,
+    source_cid: &str,
+    new_cid: &str,
+    now: i64,
+) -> Result<bool, String> {
+    if !table_exists(source, "session_usage") || !table_exists(target, "session_usage") {
+        return Ok(false);
+    }
+    let row = source
+        .query_row(
+            "SELECT used, size, credit_json FROM session_usage WHERE session_id = ?1",
+            [source_cid],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("会话用量读取失败：{error}"))?;
+    let Some((used, size, credit)) = row else {
+        return Ok(false);
+    };
+    target
+        .execute(
+            "INSERT OR REPLACE INTO session_usage (session_id, used, size, updated_at, credit_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![new_cid, used, size, now, credit],
+        )
+        .map_err(|error| format!("会话用量保存失败：{error}"))?;
+    Ok(true)
 }
 
 /// 读取一行会话（列名 + 值，按源表列序），供跨库复制按目标列取交集。
@@ -1422,6 +1483,29 @@ fn copy_session_sidecars(
         }
     }
     result
+}
+
+/// 同步用的旁路镜像：把**源会话**的旁路数据补到**目标会话**名下。
+///
+/// 与复制共用同一个原语，区别只在方向来自清单而不是当前操作：恢复重放时清单里的
+/// 源/目标 id 才是权威，不能重新推断。
+fn mirror_session_sidecars(paths: &SessionPaths, manifest: &SyncBackupManifest) -> SidecarCopy {
+    let source_variant = manifest.source.variant.unwrap_or(manifest.variant);
+    // 同档时源与目标共用同一个数据根（`paths` 由调用方按目标档给出）；跨档才需要
+    // 另解析源档根。这样测试里注入的临时根也成立，不必再传一遍源路径。
+    let resolved;
+    let source_paths = if source_variant == manifest.variant {
+        paths
+    } else {
+        resolved = SessionPaths::for_variant(source_variant);
+        &resolved
+    };
+    copy_session_sidecars(
+        source_paths,
+        paths,
+        &manifest.source.session_id,
+        &manifest.target.session_id,
+    )
 }
 
 /// 追加式目录复制：只补目标缺失的文件；已存在即内容相同（文件名是内容哈希），跳过。
@@ -3186,6 +3270,9 @@ struct SyncBackupMember {
     member_id: String,
     uid: String,
     session_id: String,
+    /// 成员所属档位（跨档组两侧不同）。旧清单没有该字段，读为 None 时按目标档处理。
+    #[serde(default)]
+    variant: Option<WbVariant>,
     /// 覆盖前正文的备份位置（相对备份目录）；来源侧不写目标，为 None。
     body_file: Option<String>,
     body_raw_digest: String,
@@ -3528,6 +3615,7 @@ fn create_sync_backup(
             member_id: plan.source_member.member_id.clone(),
             uid: plan.source_member.uid.clone(),
             session_id: plan.source_member.session_id.clone(),
+            variant: plan.source_member.variant,
             body_file: None,
             body_raw_digest: plan.source_snapshot.full_digest.clone(),
             body_normalized_digest: plan.source_snapshot.normalized.total_digest.clone(),
@@ -3537,6 +3625,7 @@ fn create_sync_backup(
             member_id: plan.target_member.member_id.clone(),
             uid: plan.target_member.uid.clone(),
             session_id: plan.target_member.session_id.clone(),
+            variant: plan.target_member.variant,
             body_file: Some(original_rel),
             body_raw_digest: plan.target_snapshot.full_digest.clone(),
             body_normalized_digest: plan.target_snapshot.normalized.total_digest.clone(),
@@ -4056,13 +4145,14 @@ fn run_sync_phases(
     backup_dir: &Path,
     manifest: &SyncBackupManifest,
     body: SyncBodyState,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, SidecarCopy), String> {
     // 仅同步归档：正文零写入，也不提交新基线。必须在这里分流——复用正文分支时
     // `Gone` 会把备份里的目标原文写回业务正文，等于补写正文。
     // 也不做行维护：没有新内容，`last_activity_at` 与项目归属都不该被这次操作改。
     if manifest.mode == SyncMode::StatusOnly {
         run_status_only_phases(paths, operation, manifest, body)?;
-        return Ok(Vec::new());
+        // 仅同步归档不写正文，也就没有新的文件检查点引用要跟随。
+        return Ok((Vec::new(), SidecarCopy::default()));
     }
     let normalized = match body {
         // 已写入：只核验现场，不重写。
@@ -4098,6 +4188,13 @@ fn run_sync_phases(
         }
         SyncBodyState::Unknown(reason) => return Err(reason),
     };
+
+    // 同步的正文是「源正文整篇替换」（`plan_sync_item` 里
+    // `incoming_text = source_snapshot.text.replace(srcId, dstId)`），源侧每一个
+    // `file-history-snapshot` 引用都会进入目标正文。因此必须把源会话的备份目录补到
+    // 目标会话目录下，否则目标里全是悬空引用（实测源会话可达上万条引用）。
+    // 放在正文就位之后、写库之前：正文是主产物，旁路是它的引用目标。
+    let sidecars = mirror_session_sidecars(paths, manifest);
 
     // 数据库步骤必须**恰好执行一次**：本次时间戳已落库说明这一步已由本操作提交过，
     // 重跑会把首次执行时合法跳过的归档副作用补上（当时目标是 active，现在回到
@@ -4141,7 +4238,7 @@ fn run_sync_phases(
         verify_sync_baseline_committed(paths, manifest)?;
     }
     advance_operation(paths, operation, OpPhase::Completed)?;
-    Ok(touched)
+    Ok((touched, sidecars))
 }
 
 /// 执行单条同步：备份 → 阶段化写入 → completed。
@@ -4243,14 +4340,14 @@ fn execute_sync_item(
         &plan.target_snapshot.full_digest,
         &operation.expected_content_digest,
     );
-    let touched = match run_sync_phases(paths, &mut operation, &backup.dir, &backup.manifest, body)
-    {
-        Ok(touched) => touched,
-        Err(error) => {
-            fail_operation(paths, &mut operation, &error);
-            return Err(error);
-        }
-    };
+    let (touched, sidecars) =
+        match run_sync_phases(paths, &mut operation, &backup.dir, &backup.manifest, body) {
+            Ok(result) => result,
+            Err(error) => {
+                fail_operation(paths, &mut operation, &error);
+                return Err(error);
+            }
+        };
     let _ = session_link::prune_operations(
         paths,
         context.variant,
@@ -4292,6 +4389,13 @@ fn execute_sync_item(
     // 「同步成功但看不到」时先看这里。
     if touched.iter().any(|col| col == "project_id") {
         item["repaired"] = json!(["project_id"]);
+    }
+    // 同步把源正文整篇搬过来，文件检查点也必须跟着到目标会话目录下。
+    if !sidecars.copied.is_empty() {
+        item["sidecars"] = json!(sidecars.copied);
+    }
+    if !sidecars.warnings.is_empty() {
+        item["sidecarWarnings"] = json!(sidecars.warnings);
     }
     Ok(item)
 }

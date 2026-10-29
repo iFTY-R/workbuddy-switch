@@ -33,6 +33,10 @@ use crate::modules::{config, lock_or_recover, process, switch};
 
 /// 一次批量的组数上限：再多应该先筛选，而不是把界面当批处理终端用。
 pub const MAX_BATCH_GROUPS: usize = 50;
+/// 补副本的目标账号上限：一个组最多补到这么多个账号。
+pub const MAX_COPY_TARGETS: usize = 20;
+/// 补副本的总量上限（组数 × 账号数）：复制是**新建**会话，一次写太多既慢又难收拾。
+pub const MAX_BATCH_COPIES: usize = 100;
 /// 保留的历史批量报告份数（落盘，供「上次批量做到哪」追溯）。
 const KEEP_BATCH_REPORTS: usize = 20;
 /// 判定「这份 running 报告是上一个进程留下的」的宽限期。
@@ -53,6 +57,8 @@ pub enum BatchOp {
     Sync,
     /// 删除关联：只解除管理关系，不动账号里的会话内容。
     Delete,
+    /// 补副本：把组内安全来源复制到指定账号（每个目标都是**新会话 id**）。
+    Copy,
 }
 
 impl BatchOp {
@@ -60,6 +66,7 @@ impl BatchOp {
         match self {
             Self::Sync => "sync",
             Self::Delete => "delete",
+            Self::Copy => "copy",
         }
     }
 }
@@ -82,8 +89,17 @@ pub struct BatchItem {
     /// 与 `synced` 同值：`synced` 只对同步说得通，`affected` 是动作无关的通用名。
     /// 双写一版后前端只读 `affected`，下个版本再删除 `synced`。
     pub affected: usize,
-    /// 计划阶段看到的目标数（Sync 为落后副本数，Delete 为成员数）。
+    /// 计划阶段看到的目标数（Sync 为落后副本数，Delete 为成员数，Copy 为待补账号数）。
     pub planned: usize,
+    /// Copy 专用：本组要补到的账号 id（计划阶段算出，执行阶段照单执行）。
+    ///
+    /// 不进报告：报告是给人看的，账号 id 对用户没有意义，真正的结果记在 `affected`
+    /// 与 `message` 里。
+    #[serde(skip)]
+    pub(crate) copy_targets: Vec<String>,
+    /// Copy 专用：源成员 id（计划阶段取到的安全来源）。
+    #[serde(skip)]
+    pub(crate) copy_source: Option<String>,
 }
 
 impl BatchItem {
@@ -98,6 +114,8 @@ impl BatchItem {
             synced: 0,
             affected: 0,
             planned: 0,
+            copy_targets: Vec::new(),
+            copy_source: None,
         }
     }
 
@@ -121,6 +139,18 @@ impl BatchItem {
         self.affected = count;
         self
     }
+
+    /// 完成但**不干净**：补了一部分、剩下的失败。
+    ///
+    /// 不能因为「有一份没补上」就把整组标成失败——已经写进去的副本是事实，
+    /// 报告要如实说「补了 N 份，另有 M 个账号失败」。
+    fn done_with_note(mut self, count: usize, note: String) -> Self {
+        self.status = ITEM_DONE.to_string();
+        self.synced = count;
+        self.affected = count;
+        self.message = Some(note);
+        self
+    }
 }
 
 /// 计划阶段的一项：条目本身 + 需要为它关闭的档位。
@@ -136,6 +166,8 @@ struct BatchJob {
     scope: Option<WbVariant>,
     op: BatchOp,
     allow_restart: bool,
+    /// Copy 专用：本批要补到的账号 id（所有组共用同一份选择）。
+    target_account_ids: Vec<String>,
     state: String,
     done: usize,
     current: Option<String>,
@@ -191,12 +223,13 @@ fn with_jobs<T>(f: impl FnOnce(&mut HashMap<String, BatchJob>) -> T) -> T {
 
 /// 取后台线程开工所需的参数（避免线程长期持锁）。
 /// 后台线程开工所需的参数：客户端、档位范围、动作、`(选择键, 组 id)` 列表、
-/// 是否允许关闭客户端。
+/// 补副本要补到的账号、是否允许关闭客户端。
 type JobParams = (
     SessionClient,
     Option<WbVariant>,
     BatchOp,
     Vec<(String, String)>,
+    Vec<String>,
     bool,
 );
 
@@ -211,6 +244,7 @@ fn job_params(job_id: &str) -> Option<JobParams> {
                 .iter()
                 .map(|item| (item.key.clone(), item.group_id.clone()))
                 .collect(),
+            job.target_account_ids.clone(),
             job.allow_restart,
         ))
     })
@@ -226,7 +260,7 @@ pub fn start_sync(
     group_keys: &[(String, String)],
     allow_restart: bool,
 ) -> Result<String, String> {
-    start(client, scope, BatchOp::Sync, group_keys, allow_restart)
+    start(client, scope, BatchOp::Sync, group_keys, &[], allow_restart)
 }
 
 /// 起一个删除关联批次：只解除关联，不删除会话内容。
@@ -235,7 +269,55 @@ pub fn start_delete(
     scope: Option<WbVariant>,
     group_keys: &[(String, String)],
 ) -> Result<String, String> {
-    start(client, scope, BatchOp::Delete, group_keys, false)
+    start(client, scope, BatchOp::Delete, group_keys, &[], false)
+}
+
+/// 起一个「补副本」批次：把每个选中组的安全来源复制到 `target_account_ids`。
+///
+/// 与同步的区别是**写的是新会话**（新 id、归属目标账号），而不是把内容盖到已有副本上，
+/// 所以它是「放大」操作：组数 × 账号数份新副本。因此：
+/// - 必须显式给出目标账号，绝不默认「所有兼容账号」——那会一次写出用户没预期的量；
+/// - 上限沿用 [`MAX_BATCH_GROUPS`]，并对「目标账号 × 组」再设一道总量上限；
+/// - 某组某账号失败只记该组，不影响其它组。
+pub fn start_copy(
+    client: SessionClient,
+    scope: Option<WbVariant>,
+    group_keys: &[(String, String)],
+    target_account_ids: &[String],
+    allow_restart: bool,
+) -> Result<String, String> {
+    let targets = normalize_target_accounts(target_account_ids)?;
+    start(
+        client,
+        scope,
+        BatchOp::Copy,
+        group_keys,
+        &targets,
+        allow_restart,
+    )
+}
+
+/// 目标账号去重保序；空选择直接拒绝（「不选」不能等价于「全选」）。
+fn normalize_target_accounts(ids: &[String]) -> Result<Vec<String>, String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut targets = Vec::new();
+    for id in ids {
+        let id = id.trim();
+        if id.is_empty() || !seen.insert(id.to_string()) {
+            continue;
+        }
+        targets.push(id.to_string());
+    }
+    if targets.is_empty() {
+        return Err("请先选择要补到哪些账号".to_string());
+    }
+    if targets.len() > MAX_COPY_TARGETS {
+        return Err(format!(
+            "一次最多补到 {MAX_COPY_TARGETS} 个账号（当前 {} 个），请减少目标账号",
+            targets.len()
+        ));
+    }
+    Ok(targets)
 }
 
 fn start(
@@ -243,6 +325,7 @@ fn start(
     scope: Option<WbVariant>,
     op: BatchOp,
     group_keys: &[(String, String)],
+    target_account_ids: &[String],
     allow_restart: bool,
 ) -> Result<String, String> {
     // 本期只开放 WorkBuddy：其余客户端要各自处理编辑器/IDE 的运行门禁，
@@ -251,6 +334,13 @@ fn start(
         return Err("批量操作当前只支持 WorkBuddy 会话".to_string());
     }
     let items = normalize_items(group_keys, client, scope)?;
+    // 放大操作的总量闸门：组数 × 账号数。单看组数会漏掉「3 个组 × 20 个账号 = 60 份新会话」。
+    let copies = items.len().saturating_mul(target_account_ids.len());
+    if copies > MAX_BATCH_COPIES {
+        return Err(format!(
+            "本次将新建 {copies} 份副本，超过单批上限 {MAX_BATCH_COPIES} 份：请减少会话组或目标账号"
+        ));
+    }
     let id = uuid::Uuid::new_v4().to_string();
     let cancel = Arc::new(AtomicBool::new(false));
     let job = BatchJob {
@@ -259,6 +349,7 @@ fn start(
         scope,
         op,
         allow_restart,
+        target_account_ids: target_account_ids.to_vec(),
         state: "queued".to_string(),
         done: 0,
         current: None,
@@ -343,7 +434,7 @@ fn normalize_items(
 }
 
 fn run_job(job_id: &str) {
-    let Some((client, scope, op, targets, allow_restart)) = job_params(job_id) else {
+    let Some((client, scope, op, targets, copy_targets, allow_restart)) = job_params(job_id) else {
         return;
     };
     let paths = client.store_paths();
@@ -378,7 +469,7 @@ fn run_job(job_id: &str) {
         if cancel_requested(job_id) {
             break;
         }
-        let planned = plan_group(client, scope, group_id, op, allow_restart);
+        let planned = plan_group(client, scope, group_id, op, allow_restart, &copy_targets);
         for variant in &planned.restart_variants {
             if !restart_variants.contains(variant) {
                 restart_variants.push(*variant);
@@ -435,8 +526,11 @@ fn run_job(job_id: &str) {
         // 「可能已部分写入」，而不是和没碰过的组一样显示 pending。
         checkpoint(job_id);
         let item = items[index].clone();
-        match execute_item(client, scope, op, &item.group_id) {
+        match execute_item(client, scope, op, &item) {
             Ok(ItemOutcome::Done(count)) => items[index] = item.done(count),
+            Ok(ItemOutcome::DoneWithNote(count, note)) => {
+                items[index] = item.done_with_note(count, note)
+            }
             Ok(ItemOutcome::Skipped(code, message)) => items[index] = item.skipped(code, message),
             Ok(ItemOutcome::Failed(code, message, fatal)) => {
                 let title = display_title(&items[index]);
@@ -498,6 +592,8 @@ fn run_job(job_id: &str) {
 
 enum ItemOutcome {
     Done(usize),
+    /// 完成了一部分：`count` 是成功数，`note` 说明剩下为什么没成。
+    DoneWithNote(usize, String),
     Skipped(&'static str, String),
     /// (原因码, 可读消息, 是否中止整批)
     Failed(&'static str, String, bool),
@@ -507,19 +603,117 @@ fn execute_item(
     client: SessionClient,
     scope: Option<WbVariant>,
     op: BatchOp,
-    group_id: &str,
+    item: &BatchItem,
 ) -> Result<ItemOutcome, String> {
     match op {
         BatchOp::Sync => {
-            let report = session_groups::sync_safe_batch(client, scope, group_id, false)?;
+            let report = session_groups::sync_safe_batch(client, scope, &item.group_id, false)?;
             Ok(summarize_sync_report(&report))
         }
         BatchOp::Delete => {
-            let report = session_groups::delete_group(client, scope, group_id)?;
+            let report = session_groups::delete_group(client, scope, &item.group_id)?;
             let removed = report.get("removed").and_then(Value::as_u64).unwrap_or(0) as usize;
             Ok(ItemOutcome::Done(removed))
         }
+        BatchOp::Copy => execute_copy(client, scope, item),
     }
+}
+
+/// 执行一组「补副本」：把计划阶段选定的账号逐个补上。
+///
+/// 逐个账号调 [`session_groups::add_member`]：它自带「目标是否已是成员 / 是否兼容 /
+/// 来源是否失效」的复核，并且在复制内核里完成成员登记。批量层只负责
+/// **不因为一个账号失败而放弃整组**，以及把结果如实汇总。
+fn execute_copy(
+    client: SessionClient,
+    scope: Option<WbVariant>,
+    item: &BatchItem,
+) -> Result<ItemOutcome, String> {
+    let Some(source) = item.copy_source.as_deref().filter(|id| !id.is_empty()) else {
+        return Ok(ItemOutcome::Skipped(
+            "noSafeSource",
+            "该组没有可确认的安全来源".to_string(),
+        ));
+    };
+    if item.copy_targets.is_empty() {
+        return Ok(ItemOutcome::Skipped(
+            "noTargets",
+            "没有需要补的账号".to_string(),
+        ));
+    }
+    let mut copied = 0_usize;
+    let mut already = 0_usize;
+    let mut failures: Vec<String> = Vec::new();
+    for account_id in &item.copy_targets {
+        match session_groups::add_member(client, scope, &item.group_id, source, account_id, false) {
+            Ok(report) => {
+                // 复制内核可能留下未完成的写入：这时必须中止整批，否则后续组会
+                // 在「有未恢复操作」的状态下继续写，现场越来越难收拾。
+                if copy_report_needs_recovery(&report) {
+                    return Ok(ItemOutcome::Failed(
+                        "needsRecovery",
+                        "本次写入需要恢复，已保留现场".to_string(),
+                        true,
+                    ));
+                }
+                match report.get("status").and_then(Value::as_str) {
+                    Some("linked") => copied += 1,
+                    Some("alreadyLinked") => already += 1,
+                    // copiedUnlinked：内容复制成功但成员没登记上——对用户等于「看不见」，
+                    // 不能算成功，也不能悄悄吞掉。
+                    Some("copiedUnlinked") => {
+                        failures.push(format!("{account_id}：已复制但关联登记失败"))
+                    }
+                    Some(other) => failures.push(format!("{account_id}：{other}")),
+                    None => failures.push(format!("{account_id}：结果不明")),
+                }
+            }
+            Err(error) => failures.push(format!("{account_id}：{error}")),
+        }
+    }
+
+    if copied > 0 {
+        return Ok(if failures.is_empty() {
+            ItemOutcome::Done(copied)
+        } else {
+            ItemOutcome::DoneWithNote(
+                copied,
+                format!(
+                    "已补 {copied} 份；另有 {} 个账号未完成：{}",
+                    failures.len(),
+                    failures.join("；")
+                ),
+            )
+        });
+    }
+    if already > 0 && failures.is_empty() {
+        return Ok(ItemOutcome::Skipped(
+            "alreadyLinked",
+            "所选账号都已有这个会话的副本".to_string(),
+        ));
+    }
+    Ok(ItemOutcome::Failed(
+        "itemFailed",
+        if failures.is_empty() {
+            "没有产生任何副本".to_string()
+        } else {
+            failures.join("；")
+        },
+        false,
+    ))
+}
+
+/// `add_member` 的报告里是否带「需要恢复」信号（复制内核把未完成写入记在报告里）。
+fn copy_report_needs_recovery(report: &Value) -> bool {
+    report
+        .get("needsRecovery")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || report
+            .get("report")
+            .and_then(|inner| inner.get("needsRecovery"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
 }
 
 /// 单组同步报告 → 结论。`needsRecovery` 是唯一的中止信号。
@@ -568,6 +762,7 @@ fn plan_group(
     group_id: &str,
     op: BatchOp,
     allow_restart: bool,
+    copy_targets: &[String],
 ) -> PlannedGroup {
     let key = format!(
         "{}:{}:{}",
@@ -577,6 +772,18 @@ fn plan_group(
     );
     match session_groups::detail(client, scope, group_id) {
         Ok(detail) => {
+            // 补副本的判定与同步完全不同（目标是「还没这个会话的账号」而不是「落后的副本」），
+            // 所以单独一条路径：混在一个函数里会让两条规则互相污染。
+            if op == BatchOp::Copy {
+                return plan_copy_from_detail(
+                    key,
+                    group_id,
+                    &detail,
+                    copy_targets,
+                    allow_restart,
+                    running_target_needs_restart,
+                );
+            }
             plan_from_detail(key, group_id, &detail, op, allow_restart, |variant, uid| {
                 running_target_needs_restart(variant, uid)
             })
@@ -585,6 +792,103 @@ fn plan_group(
             item: BatchItem::new(key, group_id, String::new()).failed("detailUnavailable", error),
             restart_variants: Vec::new(),
         },
+    }
+}
+
+/// 补副本的计划判定：来源取组内安全来源，目标取「用户勾选的账号 ∩ 该组可添加的账号」。
+///
+/// 交集之外的两类都要能被解释：用户选了但该组不兼容（或已经是成员），不算失败，
+/// 只是这一组没什么可补；一个都不剩时给出明确原因，而不是静默跳过。
+fn plan_copy_from_detail(
+    key: String,
+    group_id: &str,
+    detail: &Value,
+    requested_targets: &[String],
+    allow_restart: bool,
+    is_target_busy: impl Fn(WbVariant, &str) -> bool,
+) -> PlannedGroup {
+    let title = detail
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let mut item = BatchItem::new(key, group_id, title);
+
+    let source = detail
+        .get("safeSourceMemberId")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if source.is_empty() {
+        return PlannedGroup {
+            item: item.skipped("noSafeSource", "该组没有可确认的安全来源，无法补副本"),
+            restart_variants: Vec::new(),
+        };
+    }
+    if requested_targets.is_empty() {
+        return PlannedGroup {
+            item: item.skipped("noTargets", "没有选择要补到哪些账号"),
+            restart_variants: Vec::new(),
+        };
+    }
+
+    // `addTargets` 已经由后端算好：排除已是成员、排除不兼容的账号。
+    let available: Vec<&Value> = detail
+        .get("addTargets")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .collect();
+    let group_variant = WbVariant::parse(detail.get("groupVariant").and_then(Value::as_str));
+    let mut chosen: Vec<String> = Vec::new();
+    let mut restart_variants: Vec<WbVariant> = Vec::new();
+    for account_id in requested_targets {
+        let Some(target) = available
+            .iter()
+            .find(|target| target.get("id").and_then(Value::as_str) == Some(account_id.as_str()))
+        else {
+            continue;
+        };
+        let variant = target
+            .get("variant")
+            .and_then(Value::as_str)
+            .map(|raw| WbVariant::parse(Some(raw)))
+            .unwrap_or(group_variant);
+        let Some(uid) = target.get("uid").and_then(Value::as_str) else {
+            continue;
+        };
+        if is_target_busy(variant, uid) && !restart_variants.contains(&variant) {
+            restart_variants.push(variant);
+        }
+        chosen.push(account_id.clone());
+    }
+
+    if chosen.is_empty() {
+        return PlannedGroup {
+            item: item.skipped(
+                "noCompatibleTarget",
+                "所选账号都不与该组兼容，或已经是组成员",
+            ),
+            restart_variants,
+        };
+    }
+    if !allow_restart && !restart_variants.is_empty() {
+        // 目标账号正在客户端里用着：复制内核会拒绝写入，提前跳过比执行时逐条报错清楚。
+        return PlannedGroup {
+            item: item.skipped(
+                "appRunning",
+                "目标账号正在 WorkBuddy 中使用：勾选「允许关闭并重开」后可补副本",
+            ),
+            restart_variants,
+        };
+    }
+    item.planned = chosen.len();
+    item.copy_source = Some(source);
+    item.copy_targets = chosen;
+    PlannedGroup {
+        item,
+        restart_variants,
     }
 }
 

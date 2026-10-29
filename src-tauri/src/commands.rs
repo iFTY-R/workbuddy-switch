@@ -1525,6 +1525,31 @@ pub async fn start_session_batch_delete(
     session_batch::start_delete(client, scope, &keys).map(|job_id| json!({ "jobId": job_id }))
 }
 
+/// 启动批量补副本：把选中组的安全来源复制到 `target_account_ids`（新会话 id）。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn start_session_batch_copy(
+    client: String,
+    variant_scope: Option<String>,
+    groups: Vec<BatchGroupKey>,
+    target_account_ids: Vec<String>,
+    allow_restart: Option<bool>,
+) -> Result<Value, String> {
+    let client = session_groups::SessionClient::parse(&client)?;
+    let scope = session_groups::parse_variant_scope(variant_scope.as_deref())?;
+    let keys = groups
+        .into_iter()
+        .map(|group| (group.key, group.group_id))
+        .collect::<Vec<_>>();
+    session_batch::start_copy(
+        client,
+        scope,
+        &keys,
+        &target_account_ids,
+        allow_restart.unwrap_or(false),
+    )
+    .map(|job_id| json!({ "jobId": job_id }))
+}
+
 #[tauri::command(rename_all = "camelCase")]
 pub async fn session_batch_progress(job_id: String) -> Result<Value, String> {
     session_batch::progress(&job_id)

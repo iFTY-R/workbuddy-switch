@@ -264,6 +264,10 @@ pub fn router() -> Router {
             post(api_start_session_batch_delete),
         )
         .route(
+            "/api/session-groups/batch-copy",
+            post(api_start_session_batch_copy),
+        )
+        .route(
             "/api/session-groups/batch-progress",
             post(api_session_batch_progress),
         )
@@ -1415,6 +1419,38 @@ async fn api_start_session_batch_delete(Json(body): Json<Value>) -> Response {
         Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
     };
     match session_batch::start_delete(client, scope, &session_batch_groups(&body)) {
+        Ok(job_id) => json_ok(json!({ "jobId": job_id })),
+        Err(error) => json_err(error, StatusCode::BAD_REQUEST),
+    }
+}
+
+/// 批量补副本：把选中组的安全来源复制到 `targetAccountIds`。
+///
+/// 目标账号必须显式给出——「不选」不等于「全选」，复制是新建会话。
+async fn api_start_session_batch_copy(Json(body): Json<Value>) -> Response {
+    let (client, scope) = match session_group_request(&body) {
+        Ok(value) => value,
+        Err(error) => return json_err(error, StatusCode::BAD_REQUEST),
+    };
+    let allow_restart = body
+        .get("allowRestart")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let target_account_ids: Vec<String> = body
+        .get("targetAccountIds")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|item| item.as_str().map(str::to_string))
+        .collect();
+    match session_batch::start_copy(
+        client,
+        scope,
+        &session_batch_groups(&body),
+        &target_account_ids,
+        allow_restart,
+    ) {
         Ok(job_id) => json_ok(json!({ "jobId": job_id })),
         Err(error) => json_err(error, StatusCode::BAD_REQUEST),
     }

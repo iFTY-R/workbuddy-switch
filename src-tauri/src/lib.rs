@@ -259,6 +259,7 @@ pub fn run() {
             commands::sync_session_group_safe_batch,
             commands::start_session_batch_sync,
             commands::start_session_batch_delete,
+            commands::start_session_batch_copy,
             commands::session_batch_progress,
             commands::session_batch_cancel,
             commands::session_batch_reports,

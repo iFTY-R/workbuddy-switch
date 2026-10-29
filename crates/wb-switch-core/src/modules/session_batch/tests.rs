@@ -122,6 +122,7 @@ fn finished_job_snapshot_reports_counts_and_items() {
         scope: Some(WbVariant::Cn),
         op: BatchOp::Sync,
         allow_restart: false,
+        target_account_ids: Vec::new(),
         state: "running".to_string(),
         done: 1,
         current: Some("g2".to_string()),
@@ -416,4 +417,129 @@ fn affected_mirrors_synced_for_completed_items() {
         item.affected, 3,
         "affected 与 synced 必须同值，前端才能安全切换"
     );
+}
+
+// ── 补副本的计划判定 ──────────────────────────────────────────────────
+
+/// 一个「可添加」的候选账号：与 `detail.addTargets` 的元素同形。
+fn add_target(id: &str, uid: &str, variant: &str) -> Value {
+    json!({ "id": id, "uid": uid, "variant": variant, "nickname": id })
+}
+
+fn copy_detail(targets: Value) -> Value {
+    let mut detail = detail(
+        "补副本组",
+        "cn",
+        Some("m1"),
+        json!([member("m1", Some("cn"), "latest", "u1")]),
+    );
+    detail["addTargets"] = targets;
+    detail
+}
+
+#[test]
+fn copy_plan_intersects_requested_with_compatible_targets() {
+    let detail = copy_detail(json!([
+        add_target("acc-2", "u2", "cn"),
+        add_target("acc-3", "u3", "ai"),
+    ]));
+
+    let planned = plan_copy_from_detail(
+        "k".into(),
+        "g1",
+        &detail,
+        &["acc-2".to_string(), "acc-9".to_string()],
+        false,
+        |_, _| false,
+    );
+    assert_eq!(planned.item.status, ITEM_PENDING);
+    // 用户勾了 2 个，只有 1 个与该组兼容：计划数按**实际会补的**算，不按勾选数算。
+    assert_eq!(planned.item.planned, 1);
+    assert_eq!(planned.item.copy_targets, vec!["acc-2".to_string()]);
+    assert_eq!(planned.item.copy_source.as_deref(), Some("m1"));
+}
+
+#[test]
+fn copy_plan_skips_when_no_requested_account_is_compatible() {
+    let detail = copy_detail(json!([add_target("acc-2", "u2", "cn")]));
+    let planned = plan_copy_from_detail(
+        "k".into(),
+        "g1",
+        &detail,
+        &["acc-9".to_string()],
+        true,
+        |_, _| false,
+    );
+    assert_eq!(planned.item.status, ITEM_SKIPPED);
+    assert_eq!(
+        planned.item.reason_code.as_deref(),
+        Some("noCompatibleTarget")
+    );
+}
+
+#[test]
+fn copy_plan_requires_explicit_restart_authorization() {
+    let detail = copy_detail(json!([add_target("acc-2", "u2", "cn")]));
+    let targets = ["acc-2".to_string()];
+
+    // 目标账号正在客户端里用着，又没授权关闭 → 跳过，但要把需要关的档位带出来。
+    let blocked = plan_copy_from_detail(
+        "k".into(),
+        "g1",
+        &detail,
+        &targets,
+        false,
+        |variant, uid| variant == WbVariant::Cn && uid == "u2",
+    );
+    assert_eq!(blocked.item.status, ITEM_SKIPPED);
+    assert_eq!(blocked.item.reason_code.as_deref(), Some("appRunning"));
+    assert_eq!(blocked.restart_variants, vec![WbVariant::Cn]);
+
+    // 授权后同一组变成可执行，且仍记录要关的档位（整批只关一次）。
+    let allowed = plan_copy_from_detail("k".into(), "g1", &detail, &targets, true, |_, _| true);
+    assert_eq!(allowed.item.status, ITEM_PENDING);
+    assert_eq!(allowed.restart_variants, vec![WbVariant::Cn]);
+}
+
+#[test]
+fn copy_plan_needs_a_safe_source_and_a_target_choice() {
+    let mut no_source = copy_detail(json!([add_target("acc-2", "u2", "cn")]));
+    no_source["safeSourceMemberId"] = Value::Null;
+    let planned = plan_copy_from_detail(
+        "k".into(),
+        "g1",
+        &no_source,
+        &["acc-2".to_string()],
+        true,
+        |_, _| false,
+    );
+    assert_eq!(planned.item.reason_code.as_deref(), Some("noSafeSource"));
+
+    // 没选账号不能被当成「全选」：复制是新建会话，猜错等于替用户写了一堆副本。
+    let detail = copy_detail(json!([add_target("acc-2", "u2", "cn")]));
+    let planned = plan_copy_from_detail("k".into(), "g1", &detail, &[], true, |_, _| false);
+    assert_eq!(planned.item.reason_code.as_deref(), Some("noTargets"));
+}
+
+#[test]
+fn copy_target_guard_dedupes_and_caps() {
+    assert!(normalize_target_accounts(&[]).is_err(), "空选择必须拒绝");
+    assert_eq!(
+        normalize_target_accounts(&[" a ".to_string(), "a".to_string(), "b".to_string()]).unwrap(),
+        vec!["a".to_string(), "b".to_string()],
+        "去重保序，且要按 trim 后的值判重"
+    );
+    let too_many: Vec<String> = (0..=MAX_COPY_TARGETS).map(|i| format!("a{i}")).collect();
+    assert!(normalize_target_accounts(&too_many).is_err());
+}
+
+#[test]
+fn copy_batch_rejects_oversized_total_before_spawning() {
+    // 40 组 × 3 账号 = 120 份，超过单批上限：必须在起线程之前就拒绝。
+    let keys: Vec<(String, String)> = (0..40)
+        .map(|i| (format!("k{i}"), format!("g{i}")))
+        .collect();
+    let targets = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+    let error = start_copy(SessionClient::Workbuddy, None, &keys, &targets, false).unwrap_err();
+    assert!(error.contains("超过单批上限"), "{error}");
 }

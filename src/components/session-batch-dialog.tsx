@@ -1,10 +1,14 @@
 import { AlertTriangle, CheckCircle2, CircleSlash, Loader2, XCircle } from "lucide-react";
+import { useEffect, useState } from "react";
 
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Switch } from "@/components/ui/switch";
-import { MAX_BATCH_GROUPS, retryTargets, type BatchPlanPreview } from "@/lib/session-batch";
-import type { SessionBatchItem, SessionBatchJob, SessionBatchOp, SessionBatchTarget, SessionGroupSummary } from "@/lib/types";
+import * as api from "@/lib/api";
+import { MAX_BATCH_COPIES, MAX_BATCH_GROUPS, MAX_COPY_TARGETS, retryTargets, type BatchPlanPreview } from "@/lib/session-batch";
+import { displayName } from "@/lib/account-display";
+import type { AccountMeta, SessionBatchItem, SessionBatchJob, SessionBatchOp, SessionBatchTarget, SessionGroupSummary } from "@/lib/types";
 
 const STATUS_LABEL: Record<SessionBatchItem["status"], string> = {
   pending: "等待中",
@@ -69,7 +73,8 @@ export function SessionBatchDialog({
   starting: boolean;
   allowRestart: boolean;
   onAllowRestartChange: (value: boolean) => void;
-  onStart: () => void;
+  /** 开始执行；补副本要把选中的目标账号一起带上（后端拒绝空选择）。 */
+  onStart: (targetAccountIds?: string[]) => void;
   onCancelRun: () => void;
   onRetryFailed: (targets: SessionBatchTarget[]) => void;
   /** 导出本次报告（CSV）；不传则不显示导出按钮。 */
@@ -86,19 +91,70 @@ export function SessionBatchDialog({
     ? job.items.find((item) => item.groupId === job.current)?.title || job.current
     : null;
 
+  // ── 补副本：目标账号 ────────────────────────────────────────────────
+  /** 目标账号列表：只在补副本形态下按需拉取，其它形态不多打一次接口。 */
+  const [accounts, setAccounts] = useState<AccountMeta[]>([]);
+  const [accountsError, setAccountsError] = useState<string | null>(null);
+  const [targets, setTargets] = useState<Set<string>>(new Set());
+  const copyMode = op === "copy" && !job;
+
+  useEffect(() => {
+    if (!open || op !== "copy") return;
+    let cancelled = false;
+    setAccountsError(null);
+    api.getAccounts()
+      .then((res) => { if (!cancelled) setAccounts(res.accounts); })
+      .catch((caught) => { if (!cancelled) setAccountsError(api.asError(caught)); });
+    return () => { cancelled = true; };
+  }, [open, op]);
+
+  // 每次打开都从「没选」开始：目标账号决定会写出多少份副本，不能沿用上次的选择。
+  useEffect(() => {
+    if (!open) setTargets(new Set());
+  }, [open]);
+
+  const copies = preview.total * targets.size;
+  const copiesOverLimit = copyMode && copies > MAX_BATCH_COPIES;
+  const targetsOverLimit = copyMode && targets.size > MAX_COPY_TARGETS;
+
+  function toggleTarget(id: string, on: boolean) {
+    setTargets((current) => {
+      const next = new Set(current);
+      if (on) next.add(id);
+      else next.delete(id);
+      return next;
+    });
+  }
+
+  /** 「允许关闭并重开」开关：同步与补副本共用（删除不需要写客户端，不展示）。 */
+  const restartSwitch = (
+    <label className="flex items-start gap-3 rounded-lg border border-border p-3">
+      <Switch checked={allowRestart} onCheckedChange={onAllowRestartChange} aria-label="允许关闭并重开 WorkBuddy" />
+      <span className="min-w-0 space-y-1">
+        <span className="block text-sm font-medium">允许关闭并重开 WorkBuddy</span>
+        <span className="block text-xs leading-5 text-muted-foreground">
+          写入目标正是该档当前登录账号、且客户端在运行时，需要先关闭客户端（整批只关闭一次，完成后自动重开）。
+          不勾选时这些组会被跳过，其余组照常执行。
+        </span>
+      </span>
+    </label>
+  );
+
   return (
     <Dialog open={open} onOpenChange={(next) => { if (!next && !running) onOpenChange(false); }}>
       <DialogContent showCloseButton={!running} className="flex max-h-[min(88vh,calc(100vh-2rem))] flex-col gap-4 overflow-hidden">
         <DialogHeader>
           <DialogTitle>
-            {job ? (running ? "正在处理" : "批量结果") : op === "sync" ? "批量同步会话" : "批量删除关联"}
+            {job ? (running ? "正在处理" : "批量结果") : op === "sync" ? "批量同步会话" : op === "copy" ? "批量补副本" : "批量删除关联"}
           </DialogTitle>
           <DialogDescription>
             {job
               ? running ? "任务在后端逐组串行执行，关闭本窗口不会中断。" : "以下是逐项的最终状态。"
               : op === "sync"
                 ? "只做安全快进：不会覆盖目标账号里更新的内容。"
-                : "只解除关联，账号里的会话内容不会被删除。"}
+                : op === "copy"
+                  ? "把每个选中组的可确认来源复制成新会话补到所选账号；已经是组成员的账号不会重复复制。"
+                  : "只解除关联，账号里的会话内容不会被删除。"}
           </DialogDescription>
         </DialogHeader>
 
@@ -124,16 +180,59 @@ export function SessionBatchDialog({
                     一次最多处理 {MAX_BATCH_GROUPS} 个会话组（当前 {preview.total} 个）：请先按状态筛选，或分批执行。
                   </p>
                 )}
-                <label className="flex items-start gap-3 rounded-lg border border-border p-3">
-                  <Switch checked={allowRestart} onCheckedChange={onAllowRestartChange} aria-label="允许关闭并重开 WorkBuddy" />
-                  <span className="min-w-0 space-y-1">
-                    <span className="block text-sm font-medium">允许关闭并重开 WorkBuddy</span>
-                    <span className="block text-xs leading-5 text-muted-foreground">
-                      写入目标正是该档当前登录账号、且客户端在运行时，需要先关闭客户端（整批只关闭一次，完成后自动重开）。
-                      不勾选时这些组会被跳过，其余组照常执行。
-                    </span>
-                  </span>
-                </label>
+                {restartSwitch}
+              </div>
+            ) : op === "copy" ? (
+              <div className="space-y-3">
+                <div className="space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-medium">补到哪些账号</span>
+                    <span className="text-xs text-muted-foreground">已选 {targets.size} 个</span>
+                  </div>
+                  {accountsError ? (
+                    <p role="alert" className="rounded-lg border border-destructive/30 p-3 text-sm text-destructive">{accountsError}</p>
+                  ) : accounts.length === 0 ? (
+                    <p className="text-xs leading-5 text-muted-foreground">正在加载账号…</p>
+                  ) : (
+                    <ul className="max-h-48 space-y-0.5 overflow-y-auto rounded-lg border border-border p-1.5">
+                      {accounts.map((account) => (
+                        <li key={account.id}>
+                          <label className="flex cursor-pointer items-center gap-2.5 rounded-md px-1.5 py-1 text-sm hover:bg-muted/60">
+                            <Checkbox
+                              checked={targets.has(account.id)}
+                              onCheckedChange={(on) => toggleTarget(account.id, Boolean(on))}
+                              aria-label={`补到 ${displayName(account)}`}
+                            />
+                            <span className="min-w-0 truncate">{displayName(account)}</span>
+                            {account.email && (
+                              <span className="ml-auto shrink-0 truncate text-xs text-muted-foreground">{account.email}</span>
+                            )}
+                          </label>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+                <p className="text-xs leading-5 text-muted-foreground">
+                  最多会新建 {copies} 份副本（{preview.total} 个组 × {targets.size} 个账号）。实际数量按每个组能补的账号算，可能更少；
+                  与该组不兼容、或已经是组成员的账号会被跳过并记入结果。
+                </p>
+                {overLimit && (
+                  <p role="alert" className="rounded-lg border border-amber-500/30 p-3 text-sm text-amber-700 dark:text-amber-400">
+                    一次最多处理 {MAX_BATCH_GROUPS} 个会话组（当前 {preview.total} 个）：请先筛选或分批执行。
+                  </p>
+                )}
+                {copiesOverLimit && (
+                  <p role="alert" className="rounded-lg border border-amber-500/30 p-3 text-sm text-amber-700 dark:text-amber-400">
+                    本次将新建 {copies} 份副本，超过单批上限 {MAX_BATCH_COPIES} 份：请减少会话组或目标账号。
+                  </p>
+                )}
+                {targetsOverLimit && (
+                  <p role="alert" className="rounded-lg border border-amber-500/30 p-3 text-sm text-amber-700 dark:text-amber-400">
+                    一次最多补到 {MAX_COPY_TARGETS} 个账号（当前 {targets.size} 个）。
+                  </p>
+                )}
+                {restartSwitch}
               </div>
             ) : (
               <div className="space-y-3">
@@ -207,7 +306,7 @@ export function SessionBatchDialog({
                   </div>
                   {(item.message || item.status === "done") && (
                     <p className="mt-0.5 truncate text-xs text-muted-foreground" title={item.message}>
-                      {item.message ?? `完成 ${item.synced} 项`}
+                      {item.message ?? (op === "copy" ? `新建 ${item.affected} 份副本` : `完成 ${item.synced} 项`)}
                     </p>
                   )}
                 </li>
@@ -240,11 +339,17 @@ export function SessionBatchDialog({
                 <Button variant="outline" onClick={() => onOpenChange(false)}>取消</Button>
                 <Button
                   className={op === "delete" ? "bg-destructive text-white hover:bg-destructive/90" : undefined}
-                  onClick={onStart}
-                  disabled={starting || preview.total === 0 || overLimit}
+                  onClick={() => onStart(copyMode ? [...targets] : undefined)}
+                  disabled={
+                    starting
+                    || preview.total === 0
+                    || overLimit
+                    // 补副本：目标账号决定写出多少份新会话，没选就绝不能开始。
+                    || (copyMode && (targets.size === 0 || copiesOverLimit || targetsOverLimit))
+                  }
                 >
                   {starting ? <Loader2 className="animate-spin" /> : null}
-                  {op === "sync" ? "开始批量同步" : "确认删除关联"}
+                  {op === "sync" ? "开始批量同步" : op === "copy" ? "开始补副本" : "确认删除关联"}
                 </Button>
               </>
             )}

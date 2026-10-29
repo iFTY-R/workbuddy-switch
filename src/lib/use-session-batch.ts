@@ -6,12 +6,45 @@ import type { SessionBatchJob, SessionBatchOp, SessionBatchTarget, SessionGroupC
 /** 轮询间隔：批量以「组」为粒度推进，600ms 足够跟手，也不会把 IPC 打满。 */
 const POLL_INTERVAL = 600;
 
+/**
+ * 按动作分派到对应的启动接口。
+ *
+ * 三个动作的入参不同（补副本要多带目标账号），所以这里显式分派而不是拼一个万能对象：
+ * 少传字段应当由后端拒绝，而不是在这里被默认值悄悄补成别的语义。
+ */
+function startJob(args: StartBatchArgs): Promise<{ jobId: string }> {
+  if (args.op === "sync") {
+    return api.startSessionBatchSync({
+      client: args.client,
+      groups: args.groups,
+      variantScope: args.variantScope,
+      allowRestart: args.allowRestart,
+    });
+  }
+  if (args.op === "copy") {
+    return api.startSessionBatchCopy({
+      client: args.client,
+      groups: args.groups,
+      targetAccountIds: args.targetAccountIds ?? [],
+      variantScope: args.variantScope,
+      allowRestart: args.allowRestart,
+    });
+  }
+  return api.startSessionBatchDelete({
+    client: args.client,
+    groups: args.groups,
+    variantScope: args.variantScope,
+  });
+}
+
 export interface StartBatchArgs {
   op: SessionBatchOp;
   client: SessionGroupClient;
   groups: SessionBatchTarget[];
   variantScope?: WbVariant;
   allowRestart?: boolean;
+  /** 补副本专用：要补到的账号 id。缺失时后端会直接拒绝（不选 ≠ 全选）。 */
+  targetAccountIds?: string[];
 }
 
 /**
@@ -76,18 +109,7 @@ export function useSessionBatch() {
       stop();
       jobId.current = null;
       try {
-        const created = args.op === "sync"
-          ? await api.startSessionBatchSync({
-            client: args.client,
-            groups: args.groups,
-            variantScope: args.variantScope,
-            allowRestart: args.allowRestart,
-          })
-          : await api.startSessionBatchDelete({
-            client: args.client,
-            groups: args.groups,
-            variantScope: args.variantScope,
-          });
+        const created = await startJob(args);
         jobId.current = created.jobId;
         poll(created.jobId);
         return true;

@@ -169,6 +169,7 @@ const ROUTES: Record<string, Route> = {
   delete_session_group: { method: "POST", path: "/api/session-groups/delete" },
   start_session_batch_sync: { method: "POST", path: "/api/session-groups/batch-sync" },
   start_session_batch_delete: { method: "POST", path: "/api/session-groups/batch-delete" },
+  start_session_batch_copy: { method: "POST", path: "/api/session-groups/batch-copy" },
   session_batch_progress: { method: "POST", path: "/api/session-groups/batch-progress" },
   session_batch_cancel: { method: "POST", path: "/api/session-groups/batch-cancel" },
   session_batch_reports: { method: "POST", path: "/api/session-groups/batch-reports" },
@@ -1195,6 +1196,27 @@ export function startSessionBatchDelete(args: {
     client: args.client,
     groups: args.groups,
     ...(args.variantScope ? { variantScope: args.variantScope } : {}),
+  });
+}
+
+/**
+ * 启动批量补副本：把每个选中组的安全来源复制成**新会话**补到目标账号。
+ *
+ * 目标账号必须显式给出（不选 ≠ 全选）：复制是放大写入，猜错等于替用户造一堆副本。
+ */
+export function startSessionBatchCopy(args: {
+  client: SessionGroupClient;
+  groups: SessionBatchTarget[];
+  targetAccountIds: string[];
+  variantScope?: WbVariant;
+  allowRestart?: boolean;
+}): Promise<{ jobId: string }> {
+  return call("start_session_batch_copy", {
+    client: args.client,
+    groups: args.groups,
+    targetAccountIds: args.targetAccountIds,
+    ...(args.variantScope ? { variantScope: args.variantScope } : {}),
+    ...(args.allowRestart ? { allowRestart: true } : {}),
   });
 }
 

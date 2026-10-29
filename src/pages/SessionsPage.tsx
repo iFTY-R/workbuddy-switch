@@ -383,8 +383,13 @@ export default function SessionsPage() {
     setBatchOpen(true);
   }
 
-  async function startBatch(op: SessionBatchOp, targets: SessionBatchTarget[], allowRestart: boolean) {
-    await batch.start({ op, client, groups: targets, variantScope: scope, allowRestart });
+  async function startBatch(
+    op: SessionBatchOp,
+    targets: SessionBatchTarget[],
+    allowRestart: boolean,
+    targetAccountIds?: string[],
+  ) {
+    await batch.start({ op, client, groups: targets, variantScope: scope, allowRestart, targetAccountIds });
   }
 
   function changeClient(value: string) {
@@ -745,6 +750,7 @@ export default function SessionsPage() {
               onSelectAll={() => setSelectedKeys(new Set(filteredGroups.map((group) => group.key)))}
               onClear={clearBatchSelection}
               onSync={() => openBatch("sync")}
+              onCopy={() => openBatch("copy")}
               onDelete={() => openBatch("delete")}
             />
           )}
@@ -800,7 +806,7 @@ export default function SessionsPage() {
         starting={batch.starting}
         allowRestart={allowBatchRestart}
         onAllowRestartChange={setAllowBatchRestart}
-        onStart={() => void startBatch(batchOp, selectedTargets(groups, selectedKeys), allowBatchRestart)}
+        onStart={(targetAccountIds) => void startBatch(batchOp, selectedTargets(groups, selectedKeys), allowBatchRestart, targetAccountIds)}
         onCancelRun={() => void batch.cancel()}
         onExport={(job) => void exportBatchReport(job)}
         onRetryFailed={(targets) => {

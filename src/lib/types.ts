@@ -1122,7 +1122,14 @@ export interface VscodeSessionList {
 }
 
 /** 批量操作的两种动作：安全同步（只做 fastForward）/ 删除关联（不动会话内容）。 */
-export type SessionBatchOp = "sync" | "delete";
+/**
+ * 批量动作。
+ *
+ * - `sync`：把组内安全来源的新增内容快进到落后副本（覆盖写入已有副本）；
+ * - `delete`：只解除关联；
+ * - `copy`：把安全来源**复制成新会话**补到指定账号（放大写入，必须显式选目标）。
+ */
+export type SessionBatchOp = "sync" | "delete" | "copy";
 
 /**
  * 批量单项状态。全部由后端写入，前端只展示：

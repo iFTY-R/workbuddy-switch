@@ -1,4 +1,4 @@
-import { Link2, Trash2, X } from "lucide-react";
+import { CopyPlus, Link2, Trash2, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 
@@ -19,6 +19,7 @@ export function SessionBatchBar({
   onSelectAll,
   onClear,
   onSync,
+  onCopy,
   onDelete,
 }: {
   selectedCount: number;
@@ -32,6 +33,8 @@ export function SessionBatchBar({
   onSelectAll: () => void;
   onClear: () => void;
   onSync: () => void;
+  /** 补副本：把选中的组复制成新会话补到指定账号（放大写入，需先选目标账号）。 */
+  onCopy: () => void;
   onDelete: () => void;
 }) {
   return (
@@ -65,6 +68,9 @@ export function SessionBatchBar({
       <div className="flex shrink-0 items-center gap-2">
         <Button size="sm" className="h-8" disabled={busy} onClick={onSync}>
           <Link2 className="size-4" />批量同步
+        </Button>
+        <Button variant="outline" size="sm" className="h-8" disabled={busy} onClick={onCopy}>
+          <CopyPlus className="size-4" />补副本
         </Button>
         <Button variant="outline" size="sm" className="h-8 text-destructive" disabled={busy} onClick={onDelete}>
           <Trash2 className="size-4" />批量删除关联

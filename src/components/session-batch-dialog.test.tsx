@@ -1,14 +1,32 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { SessionBatchDialog } from "@/components/session-batch-dialog";
+import * as api from "@/lib/api";
 import type { BatchPlanPreview } from "@/lib/session-batch";
-import type { SessionBatchJob, SessionGroupSummary } from "@/lib/types";
+import type { AccountMeta, SessionBatchJob, SessionGroupSummary } from "@/lib/types";
+
+vi.mock("@/lib/api", () => ({
+  getAccounts: vi.fn(),
+  asError: (error: unknown) => (error instanceof Error ? error.message : String(error)),
+}));
+
+const getAccounts = vi.mocked(api.getAccounts);
 
 afterEach(() => {
   cleanup();
+  vi.clearAllMocks();
+});
+
+beforeEach(() => {
+  getAccounts.mockResolvedValue({
+    accounts: [
+      { id: "acc-1", uid: "u1", email: "a@x.com", nickname: "账号一" } as AccountMeta,
+      { id: "acc-2", uid: "u2", email: "b@x.com", nickname: "账号二" } as AccountMeta,
+    ],
+  });
 });
 
 function group(key: string, title: string): SessionGroupSummary {
@@ -170,5 +188,46 @@ describe("SessionBatchDialog 中断态", () => {
       },
     });
     expect(screen.getByText(/为保留恢复现场，未自动重开/)).toBeTruthy();
+  });
+});
+
+describe("SessionBatchDialog 补副本", () => {
+  it("没选目标账号时不能开始：不选不等于全选", async () => {
+    renderDialog({ op: "copy" });
+
+    const start = await screen.findByRole("button", { name: "开始补副本" });
+    expect(start).toHaveProperty("disabled", true);
+    // 账号列表要真的拉出来，而不是让用户盲选。
+    expect(await screen.findByText("账号一")).toBeTruthy();
+    expect(getAccounts).toHaveBeenCalledTimes(1);
+  });
+
+  it("勾选账号后把目标 id 交给上层，并预估最多新建多少份", async () => {
+    const callbacks = renderDialog({ op: "copy" });
+
+    await userEvent.click(await screen.findByRole("checkbox", { name: "补到 账号一" }));
+    // 3 个组 × 1 个账号：预估要给用户一个「会写出多少东西」的量级。
+    expect(screen.getByText(/最多会新建 3 份副本/)).toBeTruthy();
+
+    await userEvent.click(screen.getByRole("button", { name: "开始补副本" }));
+    expect(callbacks.onStart).toHaveBeenCalledWith(["acc-1"]);
+  });
+
+  it("组数 × 账号数超过上限时提示并禁用，不等到后端拒绝", async () => {
+    renderDialog({ op: "copy", preview: { total: 60, syncable: 60, alreadyLatest: 0, noSafeSource: 0, unknown: 0 } });
+
+    await userEvent.click(await screen.findByRole("checkbox", { name: "补到 账号一" }));
+    await userEvent.click(screen.getByRole("checkbox", { name: "补到 账号二" }));
+
+    expect(await screen.findByText(/超过单批上限 100 份/)).toBeTruthy();
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "开始补副本" })).toHaveProperty("disabled", true),
+    );
+  });
+
+  it("账号列表拉不到时给出可读错误，而不是空列表", async () => {
+    getAccounts.mockRejectedValueOnce(new Error("账号库读取失败"));
+    renderDialog({ op: "copy" });
+    expect((await screen.findByRole("alert")).textContent).toContain("账号库读取失败");
   });
 });

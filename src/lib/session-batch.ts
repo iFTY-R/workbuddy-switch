@@ -3,6 +3,12 @@ import type { SessionBatchJob, SessionBatchTarget, SessionGroupSummary } from "@
 /** 与后端 `session_batch::MAX_BATCH_GROUPS` 对齐：超过这个数要求先筛选。 */
 export const MAX_BATCH_GROUPS = 50;
 
+/** 与后端 `session_batch::MAX_COPY_TARGETS` 对齐：一个组最多补到这么多个账号。 */
+export const MAX_COPY_TARGETS = 20;
+
+/** 与后端 `session_batch::MAX_BATCH_COPIES` 对齐：组数 × 账号数的总量上限。 */
+export const MAX_BATCH_COPIES = 100;
+
 /** 计划阶段能在本地算出来的粗判定（不做任何读写，只按列表已有的摘要分组）。 */
 export interface BatchPlanPreview {
   total: number;

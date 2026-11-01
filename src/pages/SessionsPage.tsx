@@ -22,8 +22,9 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { displayName } from "@/lib/account-display";
 import * as api from "@/lib/api";
 import { jobCounts, planPreview, rangeSelection, reportToCsv, selectedTargets } from "@/lib/session-batch";
+import { describeUnifyBlockers, planUnify } from "@/lib/session-unify";
 import { useSessionBatch } from "@/lib/use-session-batch";
-import type { AccountMeta, Session, SessionBatchJob, SessionBatchOp, SessionBatchTarget, SessionGroupClient, SessionGroupCurrentAccount, SessionGroupDetail, SessionGroupMemberDetail, SessionGroupSummary, SessionGroupUnifyPlan, SessionSyncMode, WbVariant } from "@/lib/types";
+import type { AccountMeta, Session, SessionBatchJob, SessionBatchOp, SessionBatchTarget, SessionGroupClient, SessionGroupCurrentAccount, SessionGroupDetail, SessionGroupMemberDetail, SessionGroupSummary, SessionGroupUnifyPlan, WbVariant } from "@/lib/types";
 import { accountVariant, variantLabel } from "@/lib/variant";
 import { useAccountsStore } from "@/stores/accounts";
 
@@ -430,20 +431,18 @@ export default function SessionsPage() {
   async function confirmUnify() {
     const plan = unifyPlan;
     if (!plan || !detail || plan.client !== client || plan.groupId !== detail.groupId || actionBusy) return;
-    const actions = plan.targets.flatMap((target) => {
-      const preview = target.preview;
-      if (!preview || preview.verdict === "identical") return [];
-      const mode: SessionSyncMode | undefined = ["fastForward", "overwrite", "unifyOverwrite"].find(
-        (candidate) => preview.availableModes.includes(candidate as SessionSyncMode),
-      ) as SessionSyncMode | undefined;
-      return mode && preview.previewToken && preview.client === client && preview.groupId === plan.groupId
-        && preview.sourceMemberId === plan.sourceMemberId && preview.targetMemberId === target.memberId
-        ? [{ target, preview, mode }] : [];
+    // 拆成「可执行 / 阻塞」两部分。以前这里是一句静默 return：只要有一个目标
+    // 没有可写模式（判为 unknown），点确认就什么都不发生，用户无法区分
+    // 「没执行」和「执行了但没生效」。
+    const { actions: planned, blockers } = planUnify(plan);
+    if (blockers.length > 0) {
+      toast.error("无法统一这些副本", { description: describeUnifyBlockers(blockers) });
+      return;
+    }
+    const actions = planned.map((action) => {
+      const target = plan.targets.find((item) => item.memberId === action.targetMemberId)!;
+      return { target, preview: target.preview!, mode: action.mode };
     });
-    if (plan.targets.some((target) => target.error || !target.preview
-      || target.preview.client !== client || target.preview.groupId !== plan.groupId
-      || target.preview.sourceMemberId !== plan.sourceMemberId || target.preview.targetMemberId !== target.memberId
-      || (target.preview.verdict !== "identical" && !actions.some((action) => action.target.memberId === target.memberId)))) return;
     setUnifyPlan(null);
     setActionBusy(true);
     try {

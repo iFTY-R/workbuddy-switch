@@ -1921,6 +1921,64 @@ mod tests {
         );
     }
 
+    /// 掩码口径下的「落后」必须判成可快进——这是「分歧点了也消不掉」修复后的目标行为。
+    ///
+    /// 修前：目标停在共享旧版、来源在其后追加，但正文里带对方的会话 id，
+    /// 摘要前缀判定失败 → 落到 diverge/unknown，用户只能整份覆盖，快进能力丢失。
+    #[test]
+    fn masked_contents_fast_forward_instead_of_diverging() {
+        let a = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let b = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
+        let shared = format!(r#"{{"sessionId":"{a}","text":"projects/{a}.jsonl"}}"#);
+        let target_text = format!("{shared}\n");
+        let source_text = format!(
+            "{shared}\n{}\n",
+            format_args!(r#"{{"sessionId":"{b}","text":"next"}}"#)
+        );
+        let ready = |text: &str, own: &str, peers: &[&str]| {
+            ContentState::Ready(ContentSnapshot {
+                text: text.to_string(),
+                full_digest: full_digest_of(text.as_bytes()),
+                normalized: normalize_jsonl_masking(text, own, peers).unwrap(),
+            })
+        };
+        let target = ready(&target_text, a, &[b]);
+        let source = ready(&source_text, b, &[a]);
+
+        let decision = decide_sync(&source, &target, &BaselineState::Missing);
+        assert_eq!(
+            decision.verdict,
+            SyncVerdict::FastForward,
+            "掩码后目标应为严格前缀，判定理由：{}",
+            decision.reason
+        );
+    }
+
+    /// 掩码集合包含组内全部成员（含已失效成员）：失效成员的 id 仍可能残留在正文里。
+    #[test]
+    fn member_session_ids_covers_every_state() {
+        let member = |id: &str, uid: &str, session: &str, state: MemberState| LinkMember {
+            member_id: id.to_string(),
+            account_id: Some(format!("acc-{id}")),
+            uid: uid.to_string(),
+            session_id: session.to_string(),
+            variant: None,
+            state,
+            linked_at: 1,
+            last_synced_at: None,
+        };
+        let group = group_with_members(
+            "g-mask",
+            vec![
+                member("m1", "uid-a", "sess-a", MemberState::Active),
+                member("m2", "uid-b", "sess-b", MemberState::Stale),
+            ],
+        );
+        let ids = member_session_ids(&group);
+        assert!(ids.contains(&"sess-a"));
+        assert!(ids.contains(&"sess-b"), "失效成员的 id 也要掩掉");
+    }
+
     /// 顺序与重复次数参与摘要，不能按 id 去重。
     #[test]
     fn normalize_keeps_order_and_duplicates() {

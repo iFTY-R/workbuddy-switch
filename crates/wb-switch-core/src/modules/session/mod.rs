@@ -1965,7 +1965,13 @@ fn finish_copy_from_body(
     // 副本由客户端下次启动时自行迁移并写入映射行；阶段标记保留，语义为"已交接"。
     advance_operation(paths, operation, OpPhase::MappingWritten)?;
 
-    let group_id = commit_links(paths, variant, operation, &snapshot.normalized)?;
+    let group_id = commit_links(
+        paths,
+        variant,
+        operation,
+        &snapshot.normalized,
+        &snapshot.text,
+    )?;
     operation.group_id = group_id;
     advance_operation(paths, operation, OpPhase::LinksCommitted)?;
     advance_operation(paths, operation, OpPhase::Completed)?;
@@ -2002,11 +2008,27 @@ fn fail_operation(paths: &SessionPaths, operation: &mut Operation, error: &str) 
 /// 原子提交关联与配对基线（含失效成员替换与基线继承）。
 ///
 /// 整个读改写都在关联存储锁内完成；只有全部成功才推进 revision。
+/// 读取某个会话的当前正文原文；读不到/不可验证时返回 `None`。
+///
+/// 只用于「按与读取侧一致的口径重新生成基线」这类场景：调用方拿不到原文时
+/// 应该降级为原口径，而不是让写入失败。
+fn body_text(paths: &SessionPaths, session_id: &str) -> Option<String> {
+    let path = find_project_jsonl(paths, session_id)?;
+    match session_link::read_content_snapshot(&path, session_id) {
+        ContentState::Ready(snapshot) => Some(snapshot.text),
+        _ => None,
+    }
+}
+
 fn commit_links(
     paths: &SessionPaths,
     variant: WbVariant,
     operation: &Operation,
     normalized: &NormalizedContent,
+    // 刚写入的正文原文。基线必须按「与读取侧一致的口径」生成（掩掉组内所有成员 id）：
+    // 只拿 `normalized` 不够，它是只掩目标自身 id 的旧口径，存进去之后
+    // `decide_sync` 会永远认不出「目标停在基线」，把回滚误判成 ahead。
+    baseline_text: &str,
 ) -> Result<String, String> {
     let source = &operation.source;
     let target = &operation.target;
@@ -2081,7 +2103,14 @@ fn commit_links(
 
         // 本次复制的正文即来源与目标的共同基线（定向更新，不动其它配对）。
         let pair_baseline_ref = uuid::Uuid::new_v4().to_string();
-        session_link::save_baseline(paths, &pair_baseline_ref, normalized)?;
+        // 掩码集合取「此刻组内全部成员 id」：与预览、写入复核、组详情读正文时用的是
+        // 同一份推导规则，否则基线存进去就对不上，配对会永远显示「两边都有改动」。
+        let masks = session_link::member_session_ids(group);
+        let baseline_content =
+            session_link::normalize_jsonl_masking(baseline_text, &target.session_id, &masks)
+                // 归一化失败时回退到调用方已算好的内容：复制本身不该因为基线口径而失败。
+                .unwrap_or_else(|_| normalized.clone());
+        session_link::save_baseline(paths, &pair_baseline_ref, &baseline_content)?;
         session_link::set_pair_base(
             group,
             &source_member_id,
@@ -4098,6 +4127,10 @@ fn commit_sync_baseline(
     };
     let source_member_id = manifest.source.member_id.as_str();
     let target_member_id = manifest.target.member_id.as_str();
+    // 正文已落盘：按磁盘现状重读一次，用「与读取侧一致」的掩码口径生成基线。
+    // 只拿旧的 `normalized` 存进去，会让基线永远对不上读取侧的摘要——
+    // 于是 `target == baseline` 这一保护判断失效，回滚会被误判成 ahead（不给覆盖入口）。
+    let committed_text = body_text(paths, &manifest.target.session_id);
     session_link::with_link_store_write(paths, |store| {
         let Some(group) = store
             .groups
@@ -4123,7 +4156,16 @@ fn commit_sync_baseline(
             };
             target.last_synced_at = Some(manifest.last_synced_at);
         }
-        session_link::save_baseline(paths, new_baseline_ref, normalized)?;
+        session_link::save_baseline(
+            paths,
+            new_baseline_ref,
+            &session_link::normalize_jsonl_masking(
+                committed_text.as_deref().unwrap_or_default(),
+                &manifest.target.session_id,
+                &session_link::member_session_ids(group),
+            )
+            .unwrap_or_else(|_| normalized.clone()),
+        )?;
         session_link::set_pair_base(
             group,
             source_member_id,
@@ -4968,7 +5010,10 @@ fn recover_copy_operation(
     // 4) 关联与基线：已提交过就不再 commit_links，避免重复写关联存储与基线；
     // 同样先核验组与成员仍在，不能把「跳过重放」当成「产物一定还在」。
     if operation.phase < OpPhase::LinksCommitted {
-        match commit_links(paths, variant, &operation, &normalized) {
+        // 恢复路径拿不到内存里的正文：按磁盘现状重读一次，基线口径才和读取侧一致；
+        // 读不到就退回调用方算好的内容（宁可基线保守，也不让恢复失败）。
+        let text = body_text(paths, &operation.target.session_id).unwrap_or_default();
+        match commit_links(paths, variant, &operation, &normalized, &text) {
             Ok(group_id) => {
                 operation.group_id = group_id;
             }

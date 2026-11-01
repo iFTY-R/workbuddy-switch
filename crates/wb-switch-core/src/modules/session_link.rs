@@ -135,12 +135,37 @@ pub(crate) fn line_digest_of(line: &str) -> String {
 /// - 仅把本副本自己的 sessionId 文本替换为固定标记，其它 sessionId 原样保留
 ///   （沿用既有复制的引用替换语义）；键序与格式差异因此会成为保守差异。
 pub fn normalize_jsonl(text: &str, own_session_id: &str) -> Result<NormalizedContent, String> {
+    normalize_jsonl_masking(text, own_session_id, &[])
+}
+
+/// [`normalize_jsonl`] 的掩码扩展：除自身 id 外，把**同组其它成员**的 id 也换成同一个标记。
+///
+/// 为什么需要：复制 / 同步写入只重写「源自己的」会话 id，别的成员 id 原样留在正文里。
+/// 于是同一行内容在两个副本里可能出现「一个含自身 id、一个含对方 id」的情形——典型来源是
+/// 工具输出列过数据目录、路径或日志里带过别的会话 id。只掩自身 id 时，这两行**字节完全相同**
+/// 却摘要不同，整对副本因此永远判不成一致，用户看到的「分歧」点几次覆盖都消不掉。
+///
+/// 掩码面刻意收窄到「本组成员 id」：它们按定义可互换（写入时本就会被重写），
+/// 不会像「掩掉所有 uuid」那样把真正不同的内容判成一致。
+pub fn normalize_jsonl_masking(
+    text: &str,
+    own_session_id: &str,
+    peer_session_ids: &[&str],
+) -> Result<NormalizedContent, String> {
     let own_session_id = own_session_id.trim();
     if own_session_id.is_empty() {
         return Err("缺少会话 id，无法读取内容".to_string());
     }
     if text.trim().is_empty() {
         return Err("内容为空".to_string());
+    }
+    // 自身 id 排在最前，重复项去掉：同一个 id 只替换一次，避免重复字符串操作。
+    let mut masks: Vec<&str> = vec![own_session_id];
+    for peer in peer_session_ids {
+        let peer = peer.trim();
+        if !peer.is_empty() && !masks.contains(&peer) {
+            masks.push(peer);
+        }
     }
 
     let mut lines: Vec<&str> = text.split('\n').collect();
@@ -157,9 +182,19 @@ pub fn normalize_jsonl(text: &str, own_session_id: &str) -> Result<NormalizedCon
         }
         serde_json::from_str::<serde_json::Value>(line)
             .map_err(|_| format!("第 {} 行的格式无法识别，内容可能不完整", index + 1))?;
-        line_digests.push(line_digest_of(
-            &line.replace(own_session_id, SESSION_ID_MARKER),
-        ));
+        // 绝大多数行不含任何成员 id：先探测再分配，避免整篇正文逐行复制。
+        let masked = if line.contains(own_session_id) || masks.iter().any(|id| line.contains(id)) {
+            let mut owned = line.replace(own_session_id, SESSION_ID_MARKER);
+            for id in masks.iter().skip(1) {
+                if owned.contains(id) {
+                    owned = owned.replace(id, SESSION_ID_MARKER);
+                }
+            }
+            owned
+        } else {
+            line.to_string()
+        };
+        line_digests.push(line_digest_of(&masked));
     }
     let total_digest = total_digest_of(&line_digests);
     Ok(NormalizedContent {
@@ -171,6 +206,19 @@ pub fn normalize_jsonl(text: &str, own_session_id: &str) -> Result<NormalizedCon
 
 /// 读取正文快照并做完整性校验；读取期间文件被改动时判定为不可验证。
 pub fn read_content_snapshot(path: &Path, own_session_id: &str) -> ContentState {
+    read_content_snapshot_masking(path, own_session_id, &[])
+}
+
+/// [`read_content_snapshot`] 的掩码版本：归一化时一并掩掉 `peer_session_ids`。
+///
+/// 只影响摘要口径，`text` / `full_digest` 仍是原始字节（写入与恢复依赖它们）。
+/// 关联组的预览、写入复核、组详情必须**用同一份掩码集合**读取，否则三个入口会得出
+/// 不同的判定，出现「组显示落后、预览却说分歧」这类自相矛盾。
+pub fn read_content_snapshot_masking(
+    path: &Path,
+    own_session_id: &str,
+    peer_session_ids: &[&str],
+) -> ContentState {
     let before = match std::fs::metadata(path) {
         Ok(meta) => meta,
         Err(error) if error.kind() == ErrorKind::NotFound => return ContentState::Missing,
@@ -194,7 +242,7 @@ pub fn read_content_snapshot(path: &Path, own_session_id: &str) -> ContentState 
         Err(_) => return ContentState::Unavailable("内容格式异常，无法读取".to_string()),
     };
     let full_digest = full_digest_of(text.as_bytes());
-    match normalize_jsonl(&text, own_session_id) {
+    match normalize_jsonl_masking(&text, own_session_id, peer_session_ids) {
         Ok(normalized) => ContentState::Ready(ContentSnapshot {
             text,
             full_digest,
@@ -303,6 +351,20 @@ pub struct LinkMember {
 /// 成员所属档位：显式保存优先；旧存储（尚未回填）回退组级 `variant`。
 pub fn member_variant(group: &LinkGroup, member: &LinkMember) -> WbVariant {
     member.variant.unwrap_or(group.variant)
+}
+
+/// 组内所有成员的会话 id（含已失效成员）。
+///
+/// 归一化时的掩码集合就是它：这些 id 按定义可互换——复制 / 同步写入本就会把
+/// 「源自己的 id」重写成目标 id，因此它们出现在正文里只代表"当时是哪个副本"，
+/// 不构成内容差异。失效成员也要算进来：它们的 id 仍可能残留在正文里。
+pub fn member_session_ids(group: &LinkGroup) -> Vec<&str> {
+    group
+        .members
+        .iter()
+        .map(|member| member.session_id.as_str())
+        .filter(|id| !id.is_empty())
+        .collect()
 }
 
 /// 旧存储兼容：成员缺 `variant` 时用组级 `variant` 回填。
@@ -1795,6 +1857,68 @@ mod tests {
         let original = normalize_jsonl(&original, own).unwrap();
         assert_eq!(copy.total_digest, original.total_digest);
         assert_eq!(copy.line_digests, original.line_digests);
+    }
+
+    /// 掩码扩展：正文里带**对方**的会话 id 时，两份字节相同的副本必须判为一致。
+    ///
+    /// 这是「分歧点了也消不掉」的根因：只掩自身 id 时，同一行在一个副本里含自身 id、
+    /// 在另一个里含对方 id（工具输出列过目录、路径、日志带过都会这样），摘要就不同，
+    /// 整对副本永远等不起来。掩码集合限定为同组成员 id，因为它们按定义可互换。
+    #[test]
+    fn masking_peer_id_equates_copies_that_reference_each_other() {
+        let a = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let b = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
+        // 两行字节不同（各自的 sessionId 不同），但都引用 a 的路径——复制/同步后就是这样。
+        let line_a = format!(r#"{{"sessionId":"{a}","text":"projects/{a}.jsonl"}}"#);
+        let line_b = format!(r#"{{"sessionId":"{b}","text":"projects/{a}.jsonl"}}"#);
+
+        // 现状口径（只掩自身）：摘要不同，判定只能落到「分歧」。
+        let plain_a = normalize_jsonl(&format!("{line_a}\n"), a).unwrap();
+        let plain_b = normalize_jsonl(&format!("{line_b}\n"), b).unwrap();
+        assert_ne!(
+            plain_a.line_digests, plain_b.line_digests,
+            "这正是要修的缺陷：只掩自身 id 时两份副本等不起来"
+        );
+
+        // 双掩口径：两边一致。
+        let masked_a = normalize_jsonl_masking(&format!("{line_a}\n"), a, &[b]).unwrap();
+        let masked_b = normalize_jsonl_masking(&format!("{line_b}\n"), b, &[a]).unwrap();
+        assert_eq!(masked_a.line_digests, masked_b.line_digests);
+        assert_eq!(masked_a.total_digest, masked_b.total_digest);
+    }
+
+    /// 掩码不能掩盖真实内容差异。
+    #[test]
+    fn masking_peer_id_keeps_real_differences() {
+        let a = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let b = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
+        let left = format!(r#"{{"sessionId":"{a}","text":"projects/{b}.jsonl"}}"#);
+        let right = format!(r#"{{"sessionId":"{b}","text":"projects/{b}.jsonl-2"}}"#);
+        let left = normalize_jsonl_masking(&format!("{left}\n"), a, &[b]).unwrap();
+        let right = normalize_jsonl_masking(&format!("{right}\n"), b, &[a]).unwrap();
+        assert_ne!(
+            left.line_digests, right.line_digests,
+            "文本不同仍必须判为不同"
+        );
+    }
+
+    /// 掩码集合为空时与原口径逐字一致：既有调用方零行为变化。
+    #[test]
+    fn masking_without_peers_matches_plain_normalization() {
+        let own = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let text = format!(
+            "{}\n",
+            format_args!(r#"{{"sessionId":"{own}","text":"x"}}"#)
+        );
+        assert_eq!(
+            normalize_jsonl(&text, own).unwrap(),
+            normalize_jsonl_masking(&text, own, &[]).unwrap()
+        );
+        // 空串 / 与自身重复的 peer 不应改变结果。
+        assert_eq!(
+            normalize_jsonl(&text, own).unwrap(),
+            normalize_jsonl_masking(&text, own, &["", own]).unwrap()
+        );
     }
 
     /// 顺序与重复次数参与摘要，不能按 id 去重。

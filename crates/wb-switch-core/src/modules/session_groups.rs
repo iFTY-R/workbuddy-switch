@@ -1825,7 +1825,13 @@ fn member_snapshot(
             let content = if row.is_none() {
                 ContentState::Missing
             } else {
-                session::member_content_state(&member_paths, &member.session_id)
+                // 归一化掩掉组内所有成员 id：只有这样才能让「同一会话的两份副本」在
+                // 正文里各自带自己 id 时仍然等得起来（详见 `normalize_jsonl_masking`）。
+                session::member_content_state(
+                    &member_paths,
+                    &member.session_id,
+                    &session_link::member_session_ids(group),
+                )
             };
             (
                 title,

@@ -3646,8 +3646,9 @@ fn sync_rejects_forced_overwrite_when_verdict_is_unknown() {
     let paths = env.paths();
     let source_member = session_link::active_member_for(group, "uid-a").unwrap();
     let target_member = session_link::active_member_for(group, "uid-b").unwrap();
-    let source_content = member_content_state(&paths, &source_member.session_id);
-    let target_content = member_content_state(&paths, &target_member.session_id);
+    let peers = session_link::member_session_ids(group);
+    let source_content = member_content_state(&paths, &source_member.session_id, &peers);
+    let target_content = member_content_state(&paths, &target_member.session_id, &peers);
     let baseline = session_link::load_pair_baseline(
         &paths,
         group,
@@ -4435,8 +4436,9 @@ fn sync_identical_verdict_never_writes_body() {
         .unwrap();
     let source_member = session_link::active_member_for(g, "uid-a").unwrap();
     let target_member = session_link::active_member_for(g, "uid-b").unwrap();
-    let source_content = member_content_state(&paths, &source_member.session_id);
-    let target_content = member_content_state(&paths, &target_member.session_id);
+    let peers = session_link::member_session_ids(g);
+    let source_content = member_content_state(&paths, &source_member.session_id, &peers);
+    let target_content = member_content_state(&paths, &target_member.session_id, &peers);
     let baseline = session_link::load_pair_baseline(
         &paths,
         g,
@@ -5160,8 +5162,9 @@ fn status_sync_rejects_unauthorized_status_only() {
         .find(|member| member.uid == "uid-b")
         .unwrap()
         .clone();
-    let source_content = member_content_state(&env.paths(), &source_member.session_id);
-    let target_content = member_content_state(&env.paths(), &target_member.session_id);
+    let peers = session_link::member_session_ids(&store.groups[0]);
+    let source_content = member_content_state(&env.paths(), &source_member.session_id, &peers);
+    let target_content = member_content_state(&env.paths(), &target_member.session_id, &peers);
     let baseline = session_link::load_pair_baseline(
         &env.paths(),
         &store.groups[0],

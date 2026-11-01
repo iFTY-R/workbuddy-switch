@@ -2238,9 +2238,19 @@ pub fn parse_sync_selections(value: Option<&Value>) -> Result<Vec<SyncSelection>
 }
 
 /// 成员当前正文状态；`projects/` 下找不到正文一律按 Missing（不当作空正文）。
-pub(crate) fn member_content_state(paths: &SessionPaths, session_id: &str) -> ContentState {
+///
+/// `peer_session_ids` 是归一化时要一并掩掉的同组成员 id。关联组的三条链路（预览、
+/// 写入复核、组详情）必须传同一份集合：只掩自身 id 会让「正文里带对方 id」的两份副本
+/// 永远等不起来，判定随之在「分歧」上钉死。
+pub(crate) fn member_content_state(
+    paths: &SessionPaths,
+    session_id: &str,
+    peer_session_ids: &[&str],
+) -> ContentState {
     match find_project_jsonl(paths, session_id) {
-        Some(path) => session_link::read_content_snapshot(&path, session_id),
+        Some(path) => {
+            session_link::read_content_snapshot_masking(&path, session_id, peer_session_ids)
+        }
         None => ContentState::Missing,
     }
 }
@@ -2676,8 +2686,16 @@ fn preview_group_item(
         &source_member.member_id,
         &target_member.member_id,
     );
-    let source_content = member_content_state(&source_paths, &source_member.session_id);
-    let target_content = member_content_state(&target_paths, &target_member.session_id);
+    let source_content = member_content_state(
+        &source_paths,
+        &source_member.session_id,
+        &session_link::member_session_ids(group),
+    );
+    let target_content = member_content_state(
+        &target_paths,
+        &target_member.session_id,
+        &session_link::member_session_ids(group),
+    );
     let rows_match = member_row_owned_by(&source_paths, source_member)
         && member_row_owned_by(&target_paths, target_member);
     let decision = if rows_match {
@@ -2873,8 +2891,16 @@ fn plan_sync_selection(
         return skip("会话记录缺失或归属异常，检查结果已失效".to_string());
     }
     // 重新加载正文、基线与判定，再与凭据逐项核对；任一变化都跳过（含显式覆盖）。
-    let source_content = member_content_state(source_paths, &source_member.session_id);
-    let target_content = member_content_state(paths, &target_member.session_id);
+    let source_content = member_content_state(
+        source_paths,
+        &source_member.session_id,
+        &session_link::member_session_ids(group),
+    );
+    let target_content = member_content_state(
+        paths,
+        &target_member.session_id,
+        &session_link::member_session_ids(group),
+    );
     let baseline = session_link::load_pair_baseline(
         paths,
         group,

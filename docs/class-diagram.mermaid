@@ -1,0 +1,134 @@
+classDiagram
+    direction LR
+
+    class SessionKind {
+        <<enum>>
+        Main
+        Subagent
+        +as_str() &'static str
+    }
+
+    class Usage {
+        +u64 input
+        +u64 output
+        +u64 read
+        +u64 write
+    }
+
+    class Totals {
+        +Usage usage
+        +u64 records
+        +add(Usage usage)
+        +value() Value
+    }
+
+    class SplitTotals {
+        +Totals all
+        +Totals main
+        +add(Usage usage, SessionKind kind)
+        +value() Value
+    }
+
+    class SessionTotals {
+        +String key
+        +OptionString title
+        +String project
+        +String session_id
+        +Totals totals
+        +SessionKind kind
+        +String dir_project
+        +OptionString parent_session_id
+        +OptionString agent_id
+        +u64 mtime_ms
+        +OptionString parent_key
+        +OptionString agent_type
+        +OptionString agent_label
+        +u64 subagent_total
+        +u32 subagent_session_count
+        +u32 subagent_file_count
+        +u32 subagent_empty_count
+        +value() Value
+    }
+
+    class ScanFile {
+        +PathBuf root
+        +PathBuf path
+        +SessionKind kind
+        +OptionString parent_session_id
+        +u64 mtime_ms
+    }
+
+    class AgentLabel {
+        +OptionString subagent_type
+        +OptionString description
+    }
+
+    class SubagentTally {
+        +u32 files
+        +u32 empty
+    }
+
+    class SourceCollector {
+        +SplitTotals total
+        +MapStringTotals models
+        +MapStringTotals projects
+        +MapStringTotals hours
+        +MapStringSplitTotals daily
+        +MapStringMapStringTotals daily_by_model
+        +VecSessionTotals sessions
+        +bool include_subagents
+        +MapStringAgentLabel agent_labels
+        +MapStringString agent_task_ids
+        +MapTupleSubagentTally subagent_tallies
+        +u32 subagent_files
+        +u32 subagent_sessions
+        +u64 dedupe_hits
+        +u64 parse_errors
+        +add(Usage usage, Value value, str project, SessionKind kind)
+        +push_session()
+        +resolve_sessions()
+        +into_value(str name, usize files_scanned) Value
+    }
+
+    class FreeFunctions {
+        <<module>>
+        +usage_total(Usage usage) u64
+        +files(Path root, bool include_subagents, VecPathBuf output)
+        +classify(Path path) ClassifyResult
+        +agent_call_label(OptionValue arguments) OptionAgentLabel
+        +agent_task_id(OptionValue output) OptionString
+        +short_agent_id(str stem) OptionString
+        +groups(MapStringTotals groups) VecValue
+        +session_groups(VecSessionTotals sessions) VecValue
+        +source_from_roots(roots, name, cutoff, detail, include_subagents) Value
+        +get_statistics(OptionI64 days) Value
+    }
+
+    class TokenSessionTree {
+        <<typescript module>>
+        +buildSessionTree(rows, mode) SessionTreeNodeList
+        +assertTreeInvariants(nodes) stringList
+    }
+
+    class SessionTreeNode {
+        +TokenStatsGroup root
+        +TokenStatsGroupList children
+        +number own
+        +number childSum
+        +number aggregate
+    }
+
+    Usage <-- Totals : contains
+    Totals <-- SplitTotals : all / main
+    Totals <-- SessionTotals : totals
+    SessionKind <-- SessionTotals
+    SessionKind <-- ScanFile
+    SplitTotals <-- SourceCollector
+    SessionTotals <-- SourceCollector
+    AgentLabel <-- SourceCollector
+    SubagentTally <-- SourceCollector
+    SourceCollector ..> ScanFile : consumes
+    SourceCollector ..> AgentLabel : resolve
+    FreeFunctions ..> SourceCollector : drives
+    SessionTotals ..> TokenSessionTree : JSON then assembled
+    SessionTreeNode ..> SessionTotals : reads serialized fields

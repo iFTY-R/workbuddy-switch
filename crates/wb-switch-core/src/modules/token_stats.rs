@@ -990,6 +990,9 @@ impl SourceCollector {
             "hours": groups(self.hours),
             "filesScanned": files_scanned,
             "parseErrors": self.parse_errors,
+            // 只读诊断：跨文件命中请求指纹的次数。指纹本身没改（加 agent id 会
+            // 破坏 fork 副本去重），这里只暴露计数，供日后核对去重是否过量。
+            "dedupeHits": self.dedupe_hits,
             "coverageStartAt": self.coverage_start_at,
             "coverageEndAt": self.coverage_end_at,
         });
@@ -3118,6 +3121,8 @@ mod tests {
         assert_eq!(result["summary"]["records"], 2);
         assert_eq!(result["summary"]["input"], 17);
         assert_eq!(result["summary"]["output"], 5);
+        // 跨文件命中去重是只读诊断计数：重放的同一请求恰好被跳过 1 次。
+        assert_eq!(result["dedupeHits"], 1);
         fs::remove_dir_all(base).expect("remove fixture");
     }
 

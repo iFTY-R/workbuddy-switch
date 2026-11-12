@@ -17,6 +17,9 @@ vi.mock("@/lib/api", () => ({
 
 const getTokenStatistics = vi.mocked(api.getTokenStatistics);
 const SOURCE_STORAGE_KEY = "wb-switch:token-stats:source";
+/** 整页渲染很重（recharts + 371 个 tooltip + 4 个 source tab），每次交互都会全量
+ * 重渲染，默认 5s 在并行负载下会偶发超时，这里给足余量。 */
+const PAGE_TEST_TIMEOUT = 20_000;
 
 // recharts 的 ResponsiveContainer 依赖 ResizeObserver；jsdom 没有实现，
 // 补一个空实现即可（图表尺寸不影响本文件要验证的 DOM 结构）。
@@ -67,6 +70,8 @@ function sourceWithoutSubagents(): TokenStatistics {
       cacheHitRate: 1_400 / 1_800,
       mainTotal: 2_000,
       subagentTotal: 0,
+      subagentFiles: 0,
+      subagentSessions: 0,
     },
     models: [],
     projects: [],
@@ -137,7 +142,11 @@ describe("TokenStatsPage 主/子代理展示", () => {
     expect(totalText).toContain(compactToken(summary.mainTotal));
     expect(totalText).toContain(compactToken(summary.subagentTotal));
     expect(summary.mainTotal + summary.subagentTotal).toBe(summary.total);
-  });
+    // 演示数据的 subagentFiles / subagentSessions 必须等于实际子代理行数（不写死）。
+    const subagentRows = stats.sources[0].sessions.filter((row) => row.kind === "subagent").length;
+    expect(summary.subagentFiles).toBe(subagentRows);
+    expect(summary.subagentSessions).toBe(subagentRows);
+  }, PAGE_TEST_TIMEOUT);
 
   it("会话排行先组树再截断：父行合计含子代理，展开后可见子行与降级标签", async () => {
     const stats = demoStatistics();
@@ -171,13 +180,16 @@ describe("TokenStatsPage 主/子代理展示", () => {
         .getByRole("button", { name: /收起「完善 Token 统计仪表盘与本地用量分析」的子代理/ })
         .getAttribute("aria-expanded"),
     ).toBe("true");
-    // 第 1 级标签与第 3 级降级标签都要渲染，且 agentType 为 null 时不能渲染 "null"。
+    // 四级降级里第 1 / 2 / 3 / 4 级都要渲染出来。
     expect(within(ranking).getByLabelText("Explore · 查旧版检查项实现")).toBeTruthy();
+    expect(within(ranking).getByLabelText("Explore · agent-1a2fec3a")).toBeTruthy();
     expect(within(ranking).getByLabelText("子代理 · agent-9c1f4a2b")).toBeTruthy();
+    expect(within(ranking).getByLabelText("子代理 #2")).toBeTruthy();
+    // agentType 为 null 的行不能把 "null" 渲染到页面上。
     expect(ranking.textContent).not.toContain("null");
     // 演示数据没有空子代理，不显示灰字。
     expect(ranking.textContent).not.toContain("无用量记录");
-  });
+  }, PAGE_TEST_TIMEOUT);
 
   it("「展开全部」一次展开所有带子行的父行", async () => {
     getTokenStatistics.mockResolvedValue(demoStatistics());
@@ -190,7 +202,7 @@ describe("TokenStatsPage 主/子代理展示", () => {
     expect(within(ranking).getByLabelText("design-strategist · 产出游戏概念文档")).toBeTruthy();
     await user.click(within(ranking).getByRole("button", { name: "收起全部" }));
     expect(within(ranking).queryByLabelText("Explore · 查旧版检查项实现")).toBeNull();
-  });
+  }, PAGE_TEST_TIMEOUT);
 
   it("无子代理数据的来源不渲染徽标与拆分行", async () => {
     window.localStorage.setItem(SOURCE_STORAGE_KEY, "codebuddy-cli");
@@ -203,5 +215,5 @@ describe("TokenStatsPage 主/子代理展示", () => {
     expect(overview.textContent).not.toContain("主会话");
     expect(ranking.textContent).toContain("共 1 个主会话 · 0 个子代理");
     expect(ranking.textContent).toContain("只有主会话的来源");
-  });
+  }, PAGE_TEST_TIMEOUT);
 });

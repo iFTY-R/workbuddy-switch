@@ -1,0 +1,60 @@
+sequenceDiagram
+    autonumber
+    participant UI as TokenStatsPage
+    participant API as Tauri/HTTP 转发
+    participant GS as get_statistics()
+    participant SFR as source_from_roots()
+    participant FS as files()
+    participant SC as SourceCollector
+    participant LAB as agent_call_label / agent_task_id
+    participant RS as resolve_sessions()
+    participant TREE as token-session-tree.ts
+
+    UI->>API: get_token_statistics(days)
+    API->>GS: 转发
+    GS->>GS: generatedAt / cutoff 计算（四 source 共用同一时钟）
+    GS->>SFR: workbuddy（include_subagents = true）
+    GS->>SFR: workbuddy-ai（true）
+    GS->>SFR: codebuddy-cli（false，summary 必须逐位不变）
+    GS->>SFR: codebuddy-ide（index.json 路径，不走 files()）
+
+    SFR->>FS: 递归收集 *.jsonl（subagents 不再跳过）
+    FS-->>SFR: Vec<PathBuf>
+    SFR->>SFR: classify() → ScanFile{kind, parent_session_id, mtime_ms}
+    SFR->>SFR: 按 mtime_ms 升序排序（保留 fork 去重语义）
+
+    loop 每个 ScanFile（主与子同一循环，无分叉）
+        SFR->>SFR: 打开文件（失败 → parse_errors += 1，continue）
+        loop 每行
+            SFR->>SFR: ① 采集 aiTitle / summary（cutoff 之前）
+            alt type=function_call 且 name="Agent"
+                SFR->>LAB: arguments 只取 subagent_type / description（不读 prompt）
+                LAB-->>SC: agent_labels["@callId"] = AgentLabel
+            else type=function_call_result 且 name="Agent"
+                SFR->>LAB: output.text → "task_id: agent-<uuid>"
+                LAB-->>SC: agent_task_ids[callId] = agentId
+            end
+            SFR->>SFR: ② cutoff 过滤（timestamp < minimum → skip）
+            SFR->>SFR: ③ usage() 解码（唯一口径，未命中 → skip）
+            SFR->>SFR: ④ 去重指纹 (ts,in,out,read,write,model)（不改）
+            SFR->>SC: ⑤ add(usage, value, project, kind)
+            SC->>SC: total/daily 走 SplitTotals；models/projects/hours/dailyByModel 全量
+        end
+        SFR->>SC: push_session(session_id, title, project, totals, kind, parent, agentId, mtime)
+        SC->>SC: records == 0 → 不建行，但 subagent_tallies.empty += 1
+    end
+
+    SC->>RS: 阶段 2 解析（纯内存，无 IO）
+    RS->>RS: callId → agentId → AgentLabel（4 级降级）
+    RS->>RS: (dir_project, parent_session_id) → parentKey；取不到 → null（孤儿）
+    RS->>RS: 父行回填 subagentTotal / sessionCount / fileCount / emptyCount
+    SC->>SC: 阶段 3 into_value()
+    SC-->>UI: sources[].{summary(+mainTotal/subagentTotal), daily(同), sessions(扁平+新字段)}
+
+    UI->>TREE: buildSessionTree(source.sessions, sortMode)
+    TREE->>TREE: 按 parentKey 挂子行（自环/缺失父 → 根行）
+    TREE->>TREE: own = tokenTotal(root)；childSum = Σ tokenTotal(child)
+    TREE->>TREE: aggregate = own + childSum；按 aggregate 或 own 排序
+    TREE-->>UI: SessionTreeNode[]（全量，未截断）
+    UI->>UI: nodes.slice(0, RANKING_LIMIT) —— 先组树后截断
+    UI->>UI: 按 expanded 渲染子行；空子代理渲染灰字

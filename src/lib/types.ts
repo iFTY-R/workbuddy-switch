@@ -812,8 +812,16 @@ export interface CreditStatistics {
 }
 
 export interface TokenStatsTotals { total: number; input: number; output: number; cacheRead: number; cacheWrite: number; uncachedInput: number; records: number; cacheHitRate: number | null; }
-/** 带主会话 / 子代理拆分的总量：恒等 `mainTotal + subagentTotal === total`。仅 `summary` 与每日点携带，`models` / `projects` / `hours` / `dailyByModel` 仍是合并口径。 */
+/** 带主会话 / 子代理拆分的总量：恒等 `mainTotal + subagentTotal === total`。`summary` 与每日点共用。 */
 export interface TokenStatsSplitTotals extends TokenStatsTotals { mainTotal: number; subagentTotal: number; }
+/**
+ * `summary` 专用：在拆分之上再带扫描规模。
+ *
+ * `subagentFiles` 是扫到的子代理**文件**数（含 0 用量），`subagentSessions` 是其中有
+ * usage 记录的子代理数，因此 `subagentFiles >= subagentSessions`。这两个键只出现在
+ * `summary` 上，每日点没有，所以不放在 `TokenStatsSplitTotals` 里。
+ */
+export interface TokenStatsSummary extends TokenStatsSplitTotals { subagentFiles: number; subagentSessions: number; }
 export interface TokenStatsGroup extends TokenStatsTotals { key: string; title?: string | null; project?: string; sessionId?: string; }
 /** 每日趋势点：`key` 是本地日期 `YYYY-MM-DD`，额外带主 / 子拆分。 */
 export interface TokenStatsDailyPoint extends TokenStatsSplitTotals { key: string; }
@@ -849,7 +857,7 @@ export interface TokenStatsSession extends TokenStatsGroup {
   subagentEmptyCount: number;
 }
 /** `workbuddy-ai` 为国际版本地数据源，与国内版分开统计，数据源缺失时为空集。 */
-export interface TokenStatsSource { source: "workbuddy" | "workbuddy-ai" | "codebuddy-cli" | "codebuddy-ide"; summary: TokenStatsSplitTotals; models: TokenStatsGroup[]; projects: TokenStatsGroup[]; /** 扁平数组 + `parentKey`，组树与截断由前端负责；后端不截断，且仍按 `total` 降序（子代理可能排在父行前面）。 */ sessions: TokenStatsSession[]; daily: TokenStatsDailyPoint[]; /** Optional model-specific daily series for trend filtering. 注意这里**不含**主 / 子拆分。 */ dailyByModel?: Record<string, TokenStatsGroup[]>; /** 仅 CodeBuddy CLI 来源返回的最近请求明细；旧后端或缺失时按空数组处理。 */ requests?: TokenStatsRequestRow[]; hours: TokenStatsGroup[]; filesScanned: number; /** 跨文件命中请求指纹的去重次数，只读诊断用。 */ dedupeHits: number; parseErrors: number; coverageStartAt?: number | null; coverageEndAt?: number | null; }
+export interface TokenStatsSource { source: "workbuddy" | "workbuddy-ai" | "codebuddy-cli" | "codebuddy-ide"; summary: TokenStatsSummary; models: TokenStatsGroup[]; projects: TokenStatsGroup[]; /** 扁平数组 + `parentKey`，组树与截断由前端负责；后端不截断，且仍按 `total` 降序（子代理可能排在父行前面）。 */ sessions: TokenStatsSession[]; daily: TokenStatsDailyPoint[]; /** Optional model-specific daily series for trend filtering. 注意这里**不含**主 / 子拆分。 */ dailyByModel?: Record<string, TokenStatsGroup[]>; /** 仅 CodeBuddy CLI 来源返回的最近请求明细；旧后端或缺失时按空数组处理。 */ requests?: TokenStatsRequestRow[]; hours: TokenStatsGroup[]; filesScanned: number; /** 跨文件命中请求指纹的去重次数，只读诊断用。 */ dedupeHits: number; parseErrors: number; coverageStartAt?: number | null; coverageEndAt?: number | null; }
 export interface TokenStatistics { generatedAt: number; rangeDays?: number | null; sources: TokenStatsSource[]; }
 
 export interface CodeBuddyCliStatus {

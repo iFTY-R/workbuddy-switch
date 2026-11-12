@@ -32,19 +32,15 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
 
-      # 与 build.yml 分开的 key 前缀（那边是 release profile 产物），
-      # restore-keys 回落到它的缓存，以复用依赖编译产物。
-      - name: Cache cargo
-        uses: actions/cache@v4
+      # 只缓存依赖产物，不缓存整个 target：单仓库缓存上限 10GB，
+      # 三个 OS 的 target 加 build-exe 的 release target 会把配额挤爆，
+      # 超限按 LRU 淘汰后谁都命中不了（build-exe 曾因此每次全量重编 645s）。
+      # key 前缀把 debug 产物与 build-exe 的 release 产物分开，避免互相覆盖。
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-test-
-            ${{ runner.os }}-cargo-
+          key: test-debug
+          workspaces: ". -> target"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # 只跑 core：零 tauri 依赖，不需要 webkit / npm / 前端 dist。
       # 不传 --target，用 runner 原生 target——build.yml 的 mac-x64 是 arm runner 上
@@ -77,18 +73,12 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@v1
 
-      # 与 rust-tests 相同的 key 前缀，直接复用依赖编译产物。
-      - name: Cache cargo
-        uses: actions/cache@v4
+      # 与 rust-tests 同一个 key 前缀，直接复用依赖产物（同为 debug profile）。
+      - uses: Swatinem/rust-cache@v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-test-
-            ${{ runner.os }}-cargo-
+          key: test-debug
+          workspaces: ". -> target"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install frontend dependencies
         run: npm ci

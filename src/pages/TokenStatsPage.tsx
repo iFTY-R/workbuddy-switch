@@ -27,6 +27,7 @@ import {
 } from "recharts";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader } from "@/components/ui/card";
 import {
@@ -58,11 +59,14 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import * as api from "@/lib/api";
 import { getStackedSegmentVisualLayout } from "@/lib/stacked-bar-visuals";
+import { buildSessionTree, type TokenSessionNode } from "@/lib/token-session-tree";
 import type {
   TokenStatistics,
   TokenStatsGroup,
   TokenStatsRequestRow,
+  TokenStatsSession,
   TokenStatsSource,
+  TokenStatsSplitTotals,
   TokenStatsTotals,
 } from "@/lib/types";
 
@@ -194,7 +198,13 @@ function rangeLabel(range: RangeKey): string {
   return RANGE_OPTIONS.find((option) => option.key === range)?.label ?? "近 30 天";
 }
 
-function rangePoints(daily: TokenStatsGroup[], range: RangeKey): TokenStatsGroup[] {
+/**
+ * 带主 / 子拆分的趋势点：`daily` 每个点都有拆分，`dailyByModel` 的点没有
+ * （后端该维度是合并口径），缺省按 0 处理，保证合计不会变 `NaN`。
+ */
+type SplitPoint = TokenStatsGroup & { mainTotal?: number; subagentTotal?: number };
+
+function rangePoints(daily: SplitPoint[], range: RangeKey): SplitPoint[] {
   const today = dateKey(new Date());
   const firstDate =
     range === "today" ? today : range === "7d" ? dateDaysAgo(6) : dateDaysAgo(29);
@@ -220,13 +230,13 @@ function rangeBounds(range: RangeKey): { start: string; end: string } {
   return { start: dateKey(monthStart), end: today };
 }
 
-function fillRangePoints(points: TokenStatsGroup[], range: RangeKey): TokenStatsGroup[] {
+function fillRangePoints(points: SplitPoint[], range: RangeKey): SplitPoint[] {
   if (points.length === 0) return [];
   const { start, end } = rangeBounds(range);
   const byDate = new Map(points.map((point) => [point.key, point]));
   const cursor = new Date(`${start}T12:00:00`);
   const endDate = new Date(`${end}T12:00:00`);
-  const filled: TokenStatsGroup[] = [];
+  const filled: SplitPoint[] = [];
   while (cursor <= endDate) {
     const key = dateKey(cursor);
     const point = byDate.get(key);
@@ -241,6 +251,9 @@ function fillRangePoints(points: TokenStatsGroup[], range: RangeKey): TokenStats
         uncachedInput: 0,
         records: 0,
         cacheHitRate: null,
+        // 零值兜底必须带上拆分，否则主 / 子合计会变成 NaN。
+        mainTotal: 0,
+        subagentTotal: 0,
       },
     );
     cursor.setDate(cursor.getDate() + 1);
@@ -248,7 +261,7 @@ function fillRangePoints(points: TokenStatsGroup[], range: RangeKey): TokenStats
   return filled;
 }
 
-function rangeTotals(points: TokenStatsGroup[]): TokenStatsTotals {
+function rangeTotals(points: SplitPoint[]): TokenStatsSplitTotals {
   const totals = points.reduce(
     (sum, point) => ({
       total: sum.total + tokenTotal(point),
@@ -258,6 +271,8 @@ function rangeTotals(points: TokenStatsGroup[]): TokenStatsTotals {
       cacheWrite: sum.cacheWrite + point.cacheWrite,
       uncachedInput: sum.uncachedInput + point.uncachedInput,
       records: sum.records + point.records,
+      mainTotal: sum.mainTotal + (point.mainTotal ?? 0),
+      subagentTotal: sum.subagentTotal + (point.subagentTotal ?? 0),
       cacheHitRate: null,
     }),
     {
@@ -269,7 +284,9 @@ function rangeTotals(points: TokenStatsGroup[]): TokenStatsTotals {
       uncachedInput: 0,
       records: 0,
       cacheHitRate: null,
-    } satisfies TokenStatsTotals,
+      mainTotal: 0,
+      subagentTotal: 0,
+    } satisfies TokenStatsSplitTotals,
   );
 
   return {
@@ -278,7 +295,7 @@ function rangeTotals(points: TokenStatsGroup[]): TokenStatsTotals {
   };
 }
 
-function overviewTotals(source: TokenStatsSource, range: OverviewRangeKey): TokenStatsTotals {
+function overviewTotals(source: TokenStatsSource, range: OverviewRangeKey): TokenStatsSplitTotals {
   if (range === "total") return source.summary;
   return rangeTotals(rangePoints(source.daily, range));
 }
@@ -298,11 +315,13 @@ function StatMetric({
   label,
   value,
   divided = false,
+  badge,
 }: {
   icon: LucideIcon;
   label: string;
   value: string;
   divided?: boolean;
+  badge?: ReactNode;
 }) {
   return (
     <div
@@ -313,6 +332,7 @@ function StatMetric({
       <div className="flex max-w-full items-center justify-center gap-2 text-[13px] font-medium leading-5 text-muted-foreground">
         <Icon className="size-4 shrink-0 stroke-[1.75]" aria-hidden="true" />
         <span className="truncate">{label}</span>
+        {badge}
       </div>
       <div
         className="mt-3 max-w-full truncate text-[26px] font-semibold leading-8 tracking-[-0.025em] text-foreground tabular-nums"
@@ -373,6 +393,10 @@ function Overview({ source }: { source: TokenStatsSource }) {
   const [range, setRange] = useState<OverviewRangeKey>("today");
   const summary = useMemo(() => overviewTotals(source, range), [range, source]);
   const cacheRate = summary.cacheHitRate;
+  // 徽标与拆分行按 **source** 判定：该来源没有任何子代理数据时两者都不渲染，
+  // 避免暗示「有子代理但为 0」。四档切换时保持常驻，否则布局会跳。
+  const hasSubagents = source.summary.subagentTotal > 0;
+  const total = tokenTotal(summary);
 
   return (
     <section className="min-w-0 space-y-2.5" aria-labelledby="token-overview-title">
@@ -403,7 +427,18 @@ function Overview({ source }: { source: TokenStatsSource }) {
           </div>
         </CardHeader>
         <CardContent className="grid min-w-0 grid-cols-1 divide-y divide-border/60 p-0 sm:grid-cols-4 sm:divide-y-0 sm:py-5">
-          <StatMetric icon={MessagesSquare} label="总 Token" value={formatTokenCompact(tokenTotal(summary))} />
+          <StatMetric
+            icon={MessagesSquare}
+            label="总 Token"
+            value={formatTokenCompact(total)}
+            badge={
+              hasSubagents ? (
+                <Badge variant="secondary" className="shrink-0 px-1.5 py-0 text-[10px]">
+                  含子代理
+                </Badge>
+              ) : undefined
+            }
+          />
           <StatMetric icon={ArrowUpFromLine} label="输入 Token" value={formatTokenCompact(summary.input)} divided />
           <StatMetric
             icon={ArrowDownToLine}
@@ -418,6 +453,18 @@ function Overview({ source }: { source: TokenStatsSource }) {
             divided
           />
         </CardContent>
+        {hasSubagents && (
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 border-t border-border/60 px-4 py-2 text-[11px] leading-4 text-muted-foreground sm:px-5">
+            <span>
+              主会话 <span className="font-medium tabular-nums text-foreground">{formatTokenCompact(summary.mainTotal)}</span>
+            </span>
+            <span aria-hidden="true">·</span>
+            <span>
+              子代理 <span className="font-medium tabular-nums text-foreground">{formatTokenCompact(summary.subagentTotal)}</span>
+              （{percentage(summary.subagentTotal, total)}）
+            </span>
+          </div>
+        )}
       </Card>
     </section>
   );
@@ -991,46 +1038,170 @@ function Ranking({
   );
 }
 
-function SessionRanking({ groups, denominator }: { groups: TokenStatsGroup[]; denominator: number }) {
-  const rows = groups.slice(0, RANKING_LIMIT);
+function SessionRanking({ sessions, denominator }: { sessions: TokenStatsSession[]; denominator: number }) {
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set<string>());
+  // **先组树再截断**：`RANKING_LIMIT` 只约束父行数量。若先对扁平数组 slice 再
+  // 组树，某个父会话的子行会被切掉一半，出现「父行合计 91.5M 但只列出 1 个子
+  // 代理」的错误。
+  const roots = useMemo(() => buildSessionTree(sessions).slice(0, RANKING_LIMIT), [sessions]);
+  const mainCount = useMemo(
+    () => sessions.filter((session) => session.kind === "main").length,
+    [sessions],
+  );
+  // 孤儿（父会话日志缺失）也算子代理。
+  const subagentCount = sessions.length - mainCount;
+  const expandable = useMemo(
+    () => roots.filter((node) => node.children.length > 0).map((node) => node.session.key),
+    [roots],
+  );
+  const allExpanded = expandable.length > 0 && expandable.every((key) => expanded.has(key));
+
+  const toggle = (key: string) => {
+    setExpanded((previous) => {
+      const next = new Set(previous);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  const setAll = (open: boolean) => {
+    setExpanded((previous) => {
+      const next = new Set(previous);
+      for (const key of expandable) {
+        if (open) next.add(key);
+        else next.delete(key);
+      }
+      return next;
+    });
+  };
+
+  /** 子代理行：缩进一级、无展开按钮，token 用 `aggregate`（子行无 children）。 */
+  const subagentRow = (node: TokenSessionNode, ordinal?: string) => {
+    const { session } = node;
+    const share = percentage(node.aggregate, denominator);
+    const label = session.agentLabel?.trim() || session.key;
+    // `agentType` 可能为 null（后端实测约 4 成缺失），此时只显示标签与项目。
+    const meta = [session.agentType, session.project].filter(Boolean).join(" · ");
+    return (
+      <div key={session.key}>
+        <div className="mb-1 flex min-w-0 items-start gap-3 text-xs">
+          <span className="mt-0.5 w-5 shrink-0 font-mono text-[10px] text-muted-foreground">
+            {ordinal ?? ""}
+          </span>
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-muted-foreground" title={label} aria-label={label}>
+              <span className="mr-1 text-muted-foreground/60" aria-hidden="true">
+                ·
+              </span>
+              {label}
+            </div>
+            {meta && (
+              <div className="mt-0.5 truncate text-[11px] text-muted-foreground/80" title={meta}>
+                {meta}
+              </div>
+            )}
+          </div>
+          <span
+            className="mt-0.5 shrink-0 text-muted-foreground tabular-nums"
+            title={`${formatTokenExact(node.aggregate)} Token`}
+            aria-label={`${formatTokenExact(node.aggregate)} Token`}
+          >
+            {formatTokenCompact(node.aggregate)}
+          </span>
+          <span className="mt-0.5 w-12 shrink-0 text-right text-muted-foreground/80 tabular-nums">
+            {share}
+          </span>
+        </div>
+        <div className="ml-8 h-1 overflow-hidden rounded-full bg-muted">
+          <div
+            className="h-full rounded-full bg-muted-foreground/40"
+            style={{ width: share === "—" ? "0%" : share }}
+          />
+        </div>
+      </div>
+    );
+  };
+
+  const description = `按本地聚合 Token 从高到低排列；主会话行含其子代理。共 ${exact.format(mainCount)} 个主会话 · ${exact.format(subagentCount)} 个子代理。`;
 
   return (
     <section className="min-w-0 space-y-2.5" aria-labelledby="token-sessions-title">
       <SectionTitle id="token-sessions-title">消耗最高的会话</SectionTitle>
       <Card className="min-w-0 gap-0 rounded-xl py-0 shadow-none">
         <CardHeader className="px-4 pt-3 pb-0 sm:px-5">
-          <CardDescription className="text-xs">按本地聚合 Token 从高到低排列。</CardDescription>
+          <div className="flex min-w-0 flex-wrap items-center justify-between gap-2">
+            <CardDescription className="min-w-0 text-xs">{description}</CardDescription>
+            {expandable.length > 0 && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-7 shrink-0 px-2 text-xs text-muted-foreground hover:text-foreground"
+                onClick={() => setAll(!allExpanded)}
+              >
+                {allExpanded ? "收起全部" : "展开全部"}
+              </Button>
+            )}
+          </div>
         </CardHeader>
         <CardContent className="space-y-3 px-4 pt-3 pb-5 sm:px-5">
-          {rows.map((row, index) => {
-            const amount = tokenTotal(row);
-            const share = percentage(amount, denominator);
-            const label = row.title?.trim() || "未命名会话";
-            const detail = [row.project, row.title ? undefined : row.sessionId]
+          {roots.map((node, index) => {
+            const { session } = node;
+            const ordinal = String(index + 1).padStart(2, "0");
+            // 孤儿根行：没有父行可挂，仍按子代理样式渲染，不当主会话处理。
+            if (session.kind === "subagent") return subagentRow(node, ordinal);
+            const share = percentage(node.aggregate, denominator);
+            const label = session.title?.trim() || session.key;
+            const detail = [session.project, session.title ? undefined : session.sessionId]
               .filter(Boolean)
               .join(" · ");
+            const hasChildren = node.children.length > 0;
+            const open = expanded.has(session.key);
+            // 副行：项目信息 + 「自身 X · 子代理 Y（N 个）」，无子代理时不显示拆分。
+            const split =
+              session.subagentTotal > 0 || session.subagentSessionCount > 0
+                ? `自身 ${formatTokenCompact(node.own)} · 子代理 ${formatTokenCompact(session.subagentTotal)}（${exact.format(session.subagentSessionCount)} 个）`
+                : "";
+            const subline = [detail, split].filter(Boolean).join(" · ");
             return (
-              <div key={row.key}>
+              <div key={session.key}>
                 <div className="mb-1.5 flex min-w-0 items-start gap-3 text-xs">
                   <span className="mt-0.5 w-5 shrink-0 font-mono text-muted-foreground">
-                    {String(index + 1).padStart(2, "0")}
+                    {ordinal}
                   </span>
+                  {hasChildren ? (
+                    <button
+                      type="button"
+                      onClick={() => toggle(session.key)}
+                      aria-expanded={open}
+                      aria-label={`${open ? "收起" : "展开"}「${label}」的子代理`}
+                      className="-ml-1 mt-0.5 flex size-5 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none"
+                    >
+                      <ChevronRight
+                        className={`size-3.5 transition-transform ${open ? "rotate-90" : ""}`}
+                        aria-hidden="true"
+                      />
+                    </button>
+                  ) : (
+                    <span className="mt-0.5 size-5 shrink-0" aria-hidden="true" />
+                  )}
                   <div className="min-w-0 flex-1">
                     <div className="truncate font-medium" title={label} aria-label={label}>
                       {label}
                     </div>
-                    {detail && (
-                      <div className="mt-0.5 truncate text-[11px] text-muted-foreground" title={detail}>
-                        {detail}
+                    {subline && (
+                      <div className="mt-0.5 truncate text-[11px] text-muted-foreground" title={subline}>
+                        {subline}
                       </div>
                     )}
                   </div>
                   <span
                     className="mt-0.5 shrink-0 tabular-nums"
-                    title={`${formatTokenExact(amount)} Token`}
-                    aria-label={`${formatTokenExact(amount)} Token`}
+                    title={`${formatTokenExact(node.aggregate)} Token`}
+                    aria-label={`${formatTokenExact(node.aggregate)} Token`}
                   >
-                    {formatTokenCompact(amount)}
+                    {formatTokenCompact(node.aggregate)}
                   </span>
                   <span className="mt-0.5 w-12 shrink-0 text-right text-muted-foreground tabular-nums">
                     {share}
@@ -1042,10 +1213,20 @@ function SessionRanking({ groups, denominator }: { groups: TokenStatsGroup[]; de
                     style={{ width: share === "—" ? "0%" : share }}
                   />
                 </div>
+                {open && (
+                  <div className="mt-2 ml-8 space-y-2 border-l border-border/60 pl-3">
+                    {node.children.map((child) => subagentRow(child))}
+                    {session.subagentEmptyCount > 0 && (
+                      <div className="text-[11px] text-muted-foreground">
+                        另有 {exact.format(session.subagentEmptyCount)} 个子代理无用量记录
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
             );
           })}
-          {rows.length === 0 && (
+          {roots.length === 0 && (
             <div className="rounded-lg border border-dashed px-4 py-10 text-center text-sm text-muted-foreground">
               暂无统计数据
             </div>
@@ -1422,7 +1603,7 @@ function Dashboard({ source }: { source: TokenStatsSource }) {
       <TrendChart source={source} />
       <Heatmap groups={source.daily} />
       <Distribution source={source} />
-      <SessionRanking groups={source.sessions} denominator={denominator} />
+      <SessionRanking sessions={source.sessions} denominator={denominator} />
       {source.parseErrors > 0 && (
         <p className="flex items-center gap-1.5 px-1 text-xs text-amber-600">
           <CircleAlert className="size-3.5" aria-hidden="true" />

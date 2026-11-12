@@ -812,11 +812,44 @@ export interface CreditStatistics {
 }
 
 export interface TokenStatsTotals { total: number; input: number; output: number; cacheRead: number; cacheWrite: number; uncachedInput: number; records: number; cacheHitRate: number | null; }
+/** 带主会话 / 子代理拆分的总量：恒等 `mainTotal + subagentTotal === total`。仅 `summary` 与每日点携带，`models` / `projects` / `hours` / `dailyByModel` 仍是合并口径。 */
+export interface TokenStatsSplitTotals extends TokenStatsTotals { mainTotal: number; subagentTotal: number; }
 export interface TokenStatsGroup extends TokenStatsTotals { key: string; title?: string | null; project?: string; sessionId?: string; }
+/** 每日趋势点：`key` 是本地日期 `YYYY-MM-DD`，额外带主 / 子拆分。 */
+export interface TokenStatsDailyPoint extends TokenStatsSplitTotals { key: string; }
 /** 一次模型调用的明细行；`total = input + output + cacheWrite`，`uncachedInput = max(0, input - cacheRead)`，`thinking` 是 `output` 中思考过程的 token 数（回复内容 = max(0, output - thinking)），均与聚合口径一致。 */
 export interface TokenStatsRequestRow { timestamp: number; model: string; project: string; sessionId: string; title?: string | null; input: number; output: number; cacheRead: number; cacheWrite: number; uncachedInput: number; thinking: number; total: number; }
+/**
+ * 会话行：主会话与子代理**完全同构**，只靠 `kind` 区分，父子关系靠 `parentKey` 组树。
+ *
+ * 后端保证这些键一定存在（父行不存在时值为 `null` 而不是省略键），所以这里全部
+ * 必填 —— 用可选会让调用方到处写 `??`，也会掩盖契约漂移。
+ *
+ * - `parentSessionId`：路径里 `subagents` 的上一级目录名（父**文件 stem**），
+ *   **不等于**父行 `key`（后者带同名冲突后缀 ` · 2`），不能用来挂树。
+ * - `parentKey`：父行最终的 `key`，组树的唯一正确依据；孤儿为 `null`。
+ * - `agentId`：子代理文件 stem（`agent-<uuid>`）；主会话为 `null`。
+ * - `agentType`：父会话里 `Agent` 调用的 `subagent_type`，**实测约 4 成缺失**，为 `null` 时靠 `agentLabel` 兜底。
+ * - `agentLabel`：后端已按 4 级降级算好的可读标签；主会话为 `null`。
+ * - `subagentTotal`：**仅父行有值**，等于其全部子行 token 之和（权威值，前端不要自行求和）。
+ */
+export interface TokenStatsSession extends TokenStatsGroup {
+  title: string | null;
+  project: string;
+  sessionId: string;
+  kind: "main" | "subagent";
+  parentSessionId: string | null;
+  parentKey: string | null;
+  agentId: string | null;
+  agentType: string | null;
+  agentLabel: string | null;
+  subagentTotal: number;
+  subagentSessionCount: number;
+  subagentFileCount: number;
+  subagentEmptyCount: number;
+}
 /** `workbuddy-ai` 为国际版本地数据源，与国内版分开统计，数据源缺失时为空集。 */
-export interface TokenStatsSource { source: "workbuddy" | "workbuddy-ai" | "codebuddy-cli" | "codebuddy-ide"; summary: TokenStatsTotals; models: TokenStatsGroup[]; projects: TokenStatsGroup[]; sessions: TokenStatsGroup[]; daily: TokenStatsGroup[]; /** Optional model-specific daily series for trend filtering. */ dailyByModel?: Record<string, TokenStatsGroup[]>; /** 仅 CodeBuddy CLI 来源返回的最近请求明细；旧后端或缺失时按空数组处理。 */ requests?: TokenStatsRequestRow[]; hours: TokenStatsGroup[]; filesScanned: number; parseErrors: number; coverageStartAt?: number | null; coverageEndAt?: number | null; }
+export interface TokenStatsSource { source: "workbuddy" | "workbuddy-ai" | "codebuddy-cli" | "codebuddy-ide"; summary: TokenStatsSplitTotals; models: TokenStatsGroup[]; projects: TokenStatsGroup[]; /** 扁平数组 + `parentKey`，组树与截断由前端负责；后端不截断，且仍按 `total` 降序（子代理可能排在父行前面）。 */ sessions: TokenStatsSession[]; daily: TokenStatsDailyPoint[]; /** Optional model-specific daily series for trend filtering. 注意这里**不含**主 / 子拆分。 */ dailyByModel?: Record<string, TokenStatsGroup[]>; /** 仅 CodeBuddy CLI 来源返回的最近请求明细；旧后端或缺失时按空数组处理。 */ requests?: TokenStatsRequestRow[]; hours: TokenStatsGroup[]; filesScanned: number; /** 跨文件命中请求指纹的去重次数，只读诊断用。 */ dedupeHits: number; parseErrors: number; coverageStartAt?: number | null; coverageEndAt?: number | null; }
 export interface TokenStatistics { generatedAt: number; rangeDays?: number | null; sources: TokenStatsSource[]; }
 
 export interface CodeBuddyCliStatus {

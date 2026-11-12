@@ -2,7 +2,7 @@ import type {
   AccountMeta, AppStatus, AutoRotateConfig, CheckinConfig, CheckinLog,
   CodeBuddyCliStatus, CodeBuddyCliSwitchResult, CodeBuddyCnIdeStatus, CreditExpiry, CreditOfficialUsageModel, CreditStatistics,
   DisplayField,
-  GithubConfig, RateLimitHookStatus, RateLimitsPayload, RotateLog, RotateStatus, TokenStatistics, TokenStatsGroup, TokenStatsRequestRow, TokenStatsSource, TokenStatsTotals,
+  GithubConfig, RateLimitHookStatus, RateLimitsPayload, RotateLog, RotateStatus, TokenStatistics, TokenStatsDailyPoint, TokenStatsGroup, TokenStatsRequestRow, TokenStatsSession, TokenStatsSource, TokenStatsSplitTotals, TokenStatsTotals,
   Session, SessionLinkPreviewGroup, SessionLinksPreview, SessionSyncVerdict, SessionGroupClient, SessionGroupSummary, SessionGroupDetail, SessionGroupList, SessionGroupPairPreview, SessionMemberVersionStatus, TravelConfig, TravelStatus, VscodeExtStatus, VscodeSessionList,
 } from "./types";
 import { demoModeEnabled } from "./demo-mode";
@@ -519,13 +519,83 @@ function demoTokenTotals(input: number, output: number, cacheRead: number, cache
   return { total: input + output + cacheWrite, input, output, cacheRead, cacheWrite, uncachedInput: Math.max(0, input - cacheRead), records, cacheHitRate: input > 0 ? cacheRead / input : null };
 }
 
+/** 演示数据的主 / 子拆分比例：子代理约占 4 成，与实测量级同阶（真实值 4.5%~60%）。 */
+const DEMO_SUBAGENT_SHARE = 0.4;
+
+/** 带主 / 子拆分的总量：`mainTotal + subagentTotal === total` 恒等。 */
+function demoTokenSplitTotals(input: number, output: number, cacheRead: number, cacheWrite: number, records: number): TokenStatsSplitTotals {
+  const totals = demoTokenTotals(input, output, cacheRead, cacheWrite, records);
+  const subagentTotal = Math.round(totals.total * DEMO_SUBAGENT_SHARE);
+  return { ...totals, mainTotal: totals.total - subagentTotal, subagentTotal };
+}
+
 function demoTokenGroup(key: string, input: number, output: number, cacheRead: number, cacheWrite: number, records: number): TokenStatsGroup {
   return { key, ...demoTokenTotals(input, output, cacheRead, cacheWrite, records) };
 }
 
-function demoTokenSession(key: string, title: string, project: string, input: number, output: number, cacheRead: number, cacheWrite: number, records: number): TokenStatsGroup {
+/** 每日趋势点：与后端一致，额外带主 / 子拆分。 */
+function demoTokenDailyPoint(key: string, input: number, output: number, cacheRead: number, cacheWrite: number, records: number): TokenStatsDailyPoint {
+  return { key, ...demoTokenSplitTotals(input, output, cacheRead, cacheWrite, records) };
+}
+
+/**
+ * 会话行：返回「父行 + 其子代理行」的扁平数组（父行在前），与后端
+ * `sessions` 的扁平契约一致，组树交给 `buildSessionTree`。
+ *
+ * 父行的 `subagentTotal` 严格等于子行 `total` 之和（后端权威值），
+ * 因此演示数据也能通过「Σ children.aggregate === subagentTotal」不变式。
+ */
+function demoTokenSession(
+  key: string,
+  title: string,
+  project: string,
+  input: number,
+  output: number,
+  cacheRead: number,
+  cacheWrite: number,
+  records: number,
+  subagents: { agentLabel: string; agentType: string | null; input: number; output: number; cacheRead: number; cacheWrite: number }[] = [],
+): TokenStatsSession[] {
   const keyParts = key.split(" · ");
-  return { ...demoTokenGroup(key, input, output, cacheRead, cacheWrite, records), title, project, sessionId: keyParts[keyParts.length - 1] };
+  const parentStem = keyParts[keyParts.length - 1];
+  const children: TokenStatsSession[] = subagents.map((child, index) => {
+    const agentId = `agent-demo${String(index + 1).padStart(4, "0")}`;
+    return {
+      ...demoTokenTotals(child.input, child.output, child.cacheRead, child.cacheWrite, Math.max(1, Math.round(records / 4))),
+      key: `${project} · ${agentId}`,
+      title: null,
+      project,
+      sessionId: agentId,
+      kind: "subagent",
+      parentSessionId: parentStem,
+      parentKey: key,
+      agentId,
+      agentType: child.agentType,
+      agentLabel: child.agentLabel,
+      subagentTotal: 0,
+      subagentSessionCount: 0,
+      subagentFileCount: 0,
+      subagentEmptyCount: 0,
+    };
+  });
+  const parent: TokenStatsSession = {
+    ...demoTokenTotals(input, output, cacheRead, cacheWrite, records),
+    key,
+    title,
+    project,
+    sessionId: parentStem,
+    kind: "main",
+    parentSessionId: null,
+    parentKey: null,
+    agentId: null,
+    agentType: null,
+    agentLabel: null,
+    subagentTotal: children.reduce((total, child) => total + child.total, 0),
+    subagentSessionCount: children.length,
+    subagentFileCount: children.length,
+    subagentEmptyCount: 0,
+  };
+  return [parent, ...children];
 }
 
 /** 演示用请求明细：约 120 条，时间戳落在最近 14 天内且按时间倒序。 */
@@ -571,9 +641,11 @@ function demoTokenRequests(scale: number): TokenStatsRequestRow[] {
 function demoTokenSource(source: TokenStatsSource["source"], scale: number): TokenStatsSource {
   const daily = Array.from({ length: 14 }, (_, index) => {
     const wave = [0.62, 0.86, 1.1, 0.72, 1.3, 0.94, 0.38][index % 7] * scale;
-    return demoTokenGroup(localDate(13 - index), Math.round(7_600_000 * wave), Math.round(480_000 * wave), Math.round(6_650_000 * wave), Math.round(95_000 * wave), Math.round(24 * wave));
+    return demoTokenDailyPoint(localDate(13 - index), Math.round(7_600_000 * wave), Math.round(480_000 * wave), Math.round(6_650_000 * wave), Math.round(95_000 * wave), Math.round(24 * wave));
   });
-  const summary = daily.reduce((sum, row) => demoTokenTotals(sum.input + row.input, sum.output + row.output, sum.cacheRead + row.cacheRead, sum.cacheWrite + row.cacheWrite, sum.records + row.records), demoTokenTotals(0, 0, 0, 0, 0));
+  // 汇总与 daily 同口径：先把每日点求和，再按同一比例拆主 / 子。
+  const summed = daily.reduce((sum, row) => ({ input: sum.input + row.input, output: sum.output + row.output, cacheRead: sum.cacheRead + row.cacheRead, cacheWrite: sum.cacheWrite + row.cacheWrite, records: sum.records + row.records }), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, records: 0 });
+  const summary = demoTokenSplitTotals(summed.input, summed.output, summed.cacheRead, summed.cacheWrite, summed.records);
   const hours = Array.from({ length: 7 * 24 }, (_, index) => {
     const day = Math.floor(index / 24); const hour = index % 24;
     const active = Math.max(0.02, Math.exp(-Math.pow(hour - (day >= 5 ? 22 : 15), 2) / 22));
@@ -589,16 +661,24 @@ function demoTokenSource(source: TokenStatsSource["source"], scale: number): Tok
     demoTokenGroup("kimi-k3-1", 17_300_000 * scale, 1_140_000 * scale, 14_200_000 * scale, 180_000 * scale, Math.round(61 * scale)),
     demoTokenGroup("glm-5.2", 6_600_000 * scale, 630_000 * scale, 5_400_000 * scale, 80_000 * scale, Math.round(24 * scale)),
   ];
+  // 扁平数组：父行与其子代理行同层，组树由前端完成。
   const sessions = [
-    demoTokenSession("wb-switch-rust · token-stats-dashboard", "完善 Token 统计仪表盘与本地用量分析", "wb-switch-rust", 18_700_000 * scale, 1_050_000 * scale, 16_100_000 * scale, 160_000 * scale, Math.round(72 * scale)),
-    demoTokenSession("my-code-teams · settings-agent-acp", "设计 Agent 与 ACP 管理设置", "my-code-teams", 13_200_000 * scale, 890_000 * scale, 11_300_000 * scale, 120_000 * scale, Math.round(55 * scale)),
-    demoTokenSession("LetterTotTown · character-audio", "补全角色成语双音频", "LetterTotTown", 8_600_000 * scale, 640_000 * scale, 7_200_000 * scale, 80_000 * scale, Math.round(38 * scale)),
-    demoTokenSession("wb-switch-rust · account-card-redesign", "统一账号卡片视觉和交互", "wb-switch-rust", 6_300_000 * scale, 410_000 * scale, 5_400_000 * scale, 50_000 * scale, Math.round(29 * scale)),
+    ...demoTokenSession("wb-switch-rust · token-stats-dashboard", "完善 Token 统计仪表盘与本地用量分析", "wb-switch-rust", 11_200_000 * scale, 630_000 * scale, 9_600_000 * scale, 96_000 * scale, Math.round(72 * scale), [
+      { agentLabel: "Explore · 查旧版检查项实现", agentType: "Explore", input: 4_900_000 * scale, output: 280_000 * scale, cacheRead: 4_200_000 * scale, cacheWrite: 42_000 * scale },
+      { agentLabel: "software-engineer · 实现步骤编辑面板四种停靠", agentType: "software-engineer", input: 2_100_000 * scale, output: 120_000 * scale, cacheRead: 1_800_000 * scale, cacheWrite: 18_000 * scale },
+      { agentLabel: "子代理 · agent-9c1f4a2b", agentType: null, input: 500_000 * scale, output: 20_000 * scale, cacheRead: 430_000 * scale, cacheWrite: 4_000 * scale },
+    ]),
+    ...demoTokenSession("my-code-teams · settings-agent-acp", "设计 Agent 与 ACP 管理设置", "my-code-teams", 8_600_000 * scale, 610_000 * scale, 7_400_000 * scale, 78_000 * scale, Math.round(55 * scale), [
+      { agentLabel: "design-strategist · 产出游戏概念文档", agentType: "design-strategist", input: 4_600_000 * scale, output: 280_000 * scale, cacheRead: 3_900_000 * scale, cacheWrite: 42_000 * scale },
+    ]),
+    ...demoTokenSession("LetterTotTown · character-audio", "补全角色成语双音频", "LetterTotTown", 8_600_000 * scale, 640_000 * scale, 7_200_000 * scale, 80_000 * scale, Math.round(38 * scale)),
+    ...demoTokenSession("wb-switch-rust · account-card-redesign", "统一账号卡片视觉和交互", "wb-switch-rust", 6_300_000 * scale, 410_000 * scale, 5_400_000 * scale, 50_000 * scale, Math.round(29 * scale)),
   ];
   const now = Date.now();
   return {
     source, summary, models, projects, sessions, daily, hours,
     filesScanned: source === "workbuddy" ? 63 : source === "codebuddy-ide" ? 17 : 41,
+    dedupeHits: 0,
     parseErrors: 0,
     coverageStartAt: now - 13 * 86_400_000,
     coverageEndAt: now,
@@ -611,13 +691,14 @@ function demoTokenSource(source: TokenStatsSource["source"], scale: number): Tok
 function emptyTokenSource(source: TokenStatsSource["source"]): TokenStatsSource {
   return {
     source,
-    summary: demoTokenTotals(0, 0, 0, 0, 0),
+    summary: demoTokenSplitTotals(0, 0, 0, 0, 0),
     models: [],
     projects: [],
     sessions: [],
     daily: [],
     hours: [],
     filesScanned: 0,
+    dedupeHits: 0,
     parseErrors: 0,
   };
 }
